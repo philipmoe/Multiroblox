@@ -1,0 +1,6 @@
+# Build output
+/target
+
+# Built program: publish it as a GitHub Release asset instead
+*.exe
+*.pdb

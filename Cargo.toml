@@ -1,0 +1,17 @@
+[package]
+name = "multi-roblox"
+version = "1.0.0"
+edition = "2021"
+description = "Run multiple Roblox clients on one Windows machine"
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = "2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
