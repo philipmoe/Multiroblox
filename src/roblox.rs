@@ -61,9 +61,31 @@ impl Presence {
     }
 }
 
+#[derive(Clone)]
 pub enum Target {
     Place { place: u64, job: Option<String> },
+    /// A private server, from the `privateServerLinkCode` of its link.
+    Private { place: u64, link_code: String },
+    /// A roblox.com/share link; it is turned into `Private` with `resolve_share_link` before launching.
+    ShareLink { code: String },
     Follow { user_id: u64 },
+}
+
+impl Target {
+    /// The same game without pinning a server, for when the original server is gone.
+    pub fn any_server(self) -> Target {
+        match self {
+            Target::Place { place, .. } => Target::Place { place, job: None },
+            t => t,
+        }
+    }
+}
+
+pub struct Server {
+    pub id: String,
+    pub playing: u32,
+    pub max: u32,
+    pub ping: Option<u32>,
 }
 
 fn agent() -> &'static ureq::Agent {
@@ -191,10 +213,56 @@ fn tracker_id() -> String {
     format!("{}{}", 100_000 + x % 75_000, 100_000 + (x >> 24) % 800_000)
 }
 
+/// Looks up the private server behind a roblox.com/share?code=...&type=Server link.
+pub fn resolve_share_link(cookie: &str, code: &str) -> Res<Target> {
+    let body = serde_json::json!({ "linkId": code, "linkType": "Server" }).to_string();
+    let r = csrf_post(cookie, "https://apis.roblox.com/sharelinks/v1/resolve-link", Some(&body))?;
+    match r.status() {
+        200 => {
+            let v: serde_json::Value = serde_json::from_str(&r.into_string().map_err(other)?).map_err(other)?;
+            let d = &v["privateServerInviteData"];
+            let valid = d["status"].as_str().map_or(true, |s| s.eq_ignore_ascii_case("Valid"));
+            match (d["placeId"].as_u64(), d["linkCode"].as_str()) {
+                (Some(place), Some(code)) if valid => Ok(Target::Private { place, link_code: code.to_string() }),
+                _ => Err(other("the private server link is invalid or has expired")),
+            }
+        }
+        401 => Err(ApiError::Expired),
+        s => Err(other(format!("could not open the private server link (HTTP {s})"))),
+    }
+}
+
+/// Lists open public servers of a place, emptiest or fullest first.
+pub fn servers(cookie: &str, place: u64, fewest_first: bool) -> Res<Vec<Server>> {
+    let order = if fewest_first { "Asc" } else { "Desc" };
+    let url = format!(
+        "https://games.roblox.com/v1/games/{place}/servers/Public?sortOrder={order}&excludeFullGames=true&limit=100"
+    );
+    let r = finish(agent().get(&url).set("Cookie", &cookie_header(cookie)).call())?;
+    match r.status() {
+        200 => {
+            let v: serde_json::Value = serde_json::from_str(&r.into_string().map_err(other)?).map_err(other)?;
+            let list = v["data"].as_array().map(Vec::as_slice).unwrap_or_default();
+            Ok(list
+                .iter()
+                .filter_map(|s| {
+                    Some(Server {
+                        id: s["id"].as_str()?.to_string(),
+                        playing: s["playing"].as_u64().unwrap_or(0) as u32,
+                        max: s["maxPlayers"].as_u64().unwrap_or(0) as u32,
+                        ping: s["ping"].as_u64().map(|p| p as u32),
+                    })
+                })
+                .collect())
+        }
+        401 => Err(ApiError::Expired),
+        429 => Err(other("Roblox is rate limiting server lists - try again in a few seconds")),
+        s => Err(other(format!("server list failed (HTTP {s})"))),
+    }
+}
+
 pub fn launch(cookie: &str, target: &Target) -> Res<()> {
-    let ticket = auth_ticket(cookie)?;
     let tracker = tracker_id();
-    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let launcher = match target {
         Target::Place { place, job: Some(job) } => format!(
             "https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGameJob&browserTrackerId={tracker}&placeId={place}&gameId={job}&isPlayTogetherGame=false"
@@ -202,10 +270,17 @@ pub fn launch(cookie: &str, target: &Target) -> Res<()> {
         Target::Place { place, job: None } => format!(
             "https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGame&browserTrackerId={tracker}&placeId={place}&isPlayTogetherGame=false"
         ),
+        Target::Private { place, link_code } => format!(
+            "https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestPrivateGame&browserTrackerId={tracker}&placeId={place}&linkCode={}&isPlayTogetherGame=false",
+            url_encode(link_code)
+        ),
+        Target::ShareLink { .. } => return Err(other("the share link has to be resolved before launching")),
         Target::Follow { user_id } => format!(
             "https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestFollowUser&userId={user_id}"
         ),
     };
+    let ticket = auth_ticket(cookie)?;
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let uri = format!(
         "roblox-player:1+launchmode:play+gameinfo:{ticket}+launchtime:{now_ms}+placelauncherurl:{}+browsertrackerid:{tracker}+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp",
         url_encode(&launcher)
@@ -217,8 +292,33 @@ pub fn launch(cookie: &str, target: &Target) -> Res<()> {
     }
 }
 
+/// Reads what to join from the game field: a place id, a game link (with or without a private
+/// server link code) or a private server share link. `job` picks a public server.
+pub fn parse_target(input: &str, job: &str) -> Option<Target> {
+    let s = input.trim();
+    if let Some(link_code) = query_param(s, "privateServerLinkCode") {
+        return Some(Target::Private { place: parse_place(s)?, link_code });
+    }
+    let server_share = query_param(s, "type").map_or(true, |t| t.eq_ignore_ascii_case("Server"));
+    if s.contains("/share") && server_share {
+        if let Some(code) = query_param(s, "code") {
+            return Some(Target::ShareLink { code });
+        }
+    }
+    let job = job.trim();
+    Some(Target::Place { place: parse_place(s)?, job: (!job.is_empty()).then(|| job.to_string()) })
+}
+
+fn query_param(url: &str, key: &str) -> Option<String> {
+    let query = url.split_once('?')?.1.split('#').next()?;
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key && !v.is_empty()).then(|| v.to_string())
+    })
+}
+
 /// Reads a place id from plain digits or a roblox.com/games/<id>/... link.
-pub fn parse_place(input: &str) -> Option<u64> {
+fn parse_place(input: &str) -> Option<u64> {
     let s = input.trim();
     if let Ok(n) = s.parse() {
         return Some(n);

@@ -6,12 +6,12 @@ mod roblox;
 mod store;
 
 use eframe::egui::{self, Color32, RichText};
-use jobs::{Acct, Bg, Msg};
-use roblox::{Presence, Target};
+use jobs::{Acct, Bg, Msg, Watch};
+use roblox::{Presence, Server, Target};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const GREEN: Color32 = Color32::from_rgb(90, 200, 120);
@@ -34,13 +34,24 @@ struct App {
     clients: usize,
     last_poll: Instant,
     dirty: bool,
+    show_servers: bool,
+    servers: Vec<Server>,
+    servers_loading: bool,
+    servers_failed: bool,
+    fewest_first: bool,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let (tx, rx) = channel();
-        let bg = Bg { tx, ctx: cc.egui_ctx.clone(), jobs: Arc::new(AtomicUsize::new(0)) };
+        let bg = Bg {
+            tx,
+            ctx: cc.egui_ctx.clone(),
+            jobs: Arc::new(AtomicUsize::new(0)),
+            watch: Arc::new(Mutex::new(Watch::default())),
+        };
+        jobs::start_watcher(&bg);
 
         // Free the singleton in clients that were started earlier, then claim it for ourselves.
         let freed = multi::release_in_running_clients();
@@ -62,6 +73,11 @@ impl App {
             clients: multi::roblox_pids().len(),
             last_poll: Instant::now(),
             dirty: false,
+            show_servers: false,
+            servers: Vec::new(),
+            servers_loading: false,
+            servers_failed: false,
+            fewest_first: false,
         };
         if freed > 0 {
             app.say(format!("Released the singleton lock in {freed} running client handle(s)."));
@@ -117,13 +133,40 @@ impl App {
     }
 
     fn target(&mut self) -> Option<Target> {
-        let Some(place) = roblox::parse_place(&self.cfg.place_id) else {
-            self.say("Enter a place ID or a roblox.com/games/... link first.");
-            return None;
+        let t = roblox::parse_target(&self.cfg.place_id, &self.cfg.job_id);
+        if t.is_none() {
+            self.say("Enter a place ID, a game link or a private server link first.");
+        }
+        t
+    }
+
+    fn load_servers(&mut self) {
+        let place = match self.target() {
+            Some(Target::Place { place, .. }) => place,
+            Some(_) => {
+                self.say("The server list is for public servers - replace the private server link with the game first.");
+                return;
+            }
+            None => return,
         };
-        let job = self.cfg.job_id.trim();
-        let job = (!job.is_empty()).then(|| job.to_string());
-        Some(Target::Place { place, job })
+        let Some(id) = self.cfg.main.or_else(|| self.cfg.accounts.first().map(|a| a.user_id)) else {
+            self.say("Add an account first - the server list is fetched as a signed-in user.");
+            return;
+        };
+        let Some(a) = self.acct(id) else {
+            return;
+        };
+        self.show_servers = true;
+        self.servers_loading = true;
+        self.servers_failed = false;
+        self.servers.clear();
+        jobs::servers(&self.bg, a, place, self.fewest_first);
+    }
+
+    /// Ids of tracked clients that belong to alts, i.e. every account except main.
+    fn alt_client_pids(&self) -> Vec<u32> {
+        let main = self.cfg.main;
+        self.bg.watch().clients.iter().filter(|(id, _)| Some(**id) != main).map(|(_, c)| c.pid).collect()
     }
 
     fn pump(&mut self) {
@@ -154,6 +197,11 @@ impl App {
                 Msg::Expired(id) => {
                     self.expired.insert(id);
                 }
+                Msg::Servers(list) => {
+                    self.servers_loading = false;
+                    self.servers_failed = list.is_none();
+                    self.servers = list.unwrap_or_default();
+                }
             }
         }
     }
@@ -174,6 +222,7 @@ impl App {
             ui.label(format!("{} client(s) running", self.clients));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Kill all").on_hover_text("Close every running Roblox client").clicked() {
+                    self.bg.watch().clients.clear();
                     let n = multi::kill_all();
                     self.say(format!("Closed {n} client(s)."));
                 }
@@ -187,6 +236,13 @@ impl App {
                     self.held = multi::acquire();
                     self.say(format!("Released {n} handle(s)."));
                 }
+                if ui.button("Minimize alts").on_hover_text("Minimize the alt clients started from here").clicked() {
+                    let pids = self.alt_client_pids();
+                    for &pid in &pids {
+                        multi::minimize_client(pid);
+                    }
+                    self.say(format!("Minimized {} alt client(s).", pids.len()));
+                }
                 if self.bg.jobs.load(Ordering::Relaxed) > 0 {
                     ui.colored_label(BLUE, "Working...");
                 }
@@ -198,20 +254,37 @@ impl App {
         ui.add_space(4.0);
         ui.heading("Game");
         ui.add_space(6.0);
-        ui.label("Place ID or game link");
+        ui.label("Place ID, game link or private server link");
         let a = ui.add(
             egui::TextEdit::singleline(&mut self.cfg.place_id)
                 .hint_text("4924922222")
                 .desired_width(f32::INFINITY),
         );
-        ui.label("Job ID (optional, to pick a server)");
+        let mut browse = false;
+        ui.horizontal(|ui| {
+            ui.label("Job ID (optional, to pick a server)");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                browse = ui.small_button("Browse").on_hover_text("Pick from the game's open servers").clicked();
+            });
+        });
         let b = ui.add(egui::TextEdit::singleline(&mut self.cfg.job_id).desired_width(f32::INFINITY));
         self.dirty |= a.changed() || b.changed();
+        if browse {
+            self.load_servers();
+        }
         ui.horizontal(|ui| {
             ui.label("Delay between launches");
             let d = ui.add(egui::DragValue::new(&mut self.cfg.delay_secs).range(0..=120).suffix(" s"));
             self.dirty |= d.changed();
         });
+        let r = ui.checkbox(&mut self.cfg.auto_rejoin, "Auto-rejoin dropped accounts").on_hover_text(
+            "Every 30 s, checks each client launched from here. If its account is no longer in game \
+             (disconnected, kicked, or the 20-minute idle kick), the client is closed and launched again.",
+        );
+        let l = ui
+            .checkbox(&mut self.cfg.low_priority_alts, "Low CPU priority for alts")
+            .on_hover_text("Alt clients run at below-normal priority so the main client stays smooth.");
+        self.dirty |= r.changed() || l.changed();
         ui.add_space(6.0);
         ui.separator();
 
@@ -408,6 +481,57 @@ impl App {
         });
     }
 
+    fn servers_window(&mut self, ctx: &egui::Context) {
+        if !self.show_servers {
+            return;
+        }
+        let mut open = true;
+        let mut picked = None;
+        let mut reload = false;
+        egui::Window::new("Servers")
+            .open(&mut open)
+            .collapsible(false)
+            .default_size([340.0, 420.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    reload |= ui.checkbox(&mut self.fewest_first, "Fewest players first").changed();
+                    reload |= ui.button("Reload").clicked();
+                });
+                ui.separator();
+                if self.servers_loading {
+                    ui.colored_label(BLUE, "Loading...");
+                } else if self.servers_failed {
+                    ui.colored_label(RED, "Could not load servers - see the log.");
+                } else if self.servers.is_empty() {
+                    ui.label(RichText::new("No open servers found.").weak());
+                } else {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        egui::Grid::new("servers").num_columns(3).striped(true).spacing([16.0, 6.0]).show(ui, |ui| {
+                            for s in &self.servers {
+                                ui.label(format!("{}/{} players", s.playing, s.max));
+                                let ping = s.ping.map_or("-".to_string(), |p| format!("{p} ms"));
+                                ui.label(RichText::new(ping).weak());
+                                if ui.button("Use").on_hover_text(s.id.as_str()).clicked() {
+                                    picked = Some(s.id.clone());
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                }
+            });
+        if let Some(id) = picked {
+            self.cfg.job_id = id;
+            self.dirty = true;
+            open = false;
+            self.say("Server picked - launches now go to that server.");
+        }
+        self.show_servers = open;
+        if reload {
+            self.load_servers();
+        }
+    }
+
     fn log_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Log").strong());
@@ -426,6 +550,12 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump();
+        {
+            let mut w = self.bg.watch();
+            w.auto_rejoin = self.cfg.auto_rejoin;
+            w.low_priority_alts = self.cfg.low_priority_alts;
+            w.main = self.cfg.main;
+        }
         if self.last_poll.elapsed() > Duration::from_secs(2) {
             self.clients = multi::roblox_pids().len();
             self.last_poll = Instant::now();
@@ -448,6 +578,8 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             self.accounts_panel(ui);
         });
+        let ctx = ui.ctx().clone();
+        self.servers_window(&ctx);
         if self.dirty {
             self.save();
         }

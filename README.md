@@ -12,7 +12,14 @@ Run several Roblox clients side by side on one Windows PC, each signed in to a d
 - **Account list.** Add accounts by their `.ROBLOSECURITY` cookie and see each one's online / in-game status.
 - **Launch into a game.** Paste a place ID or a `roblox.com/games/...` link, optionally a job ID to pick
   a server, and launch the main account, the selected alts, or a single account.
+- **Server picker.** Browse the game's open servers by player count and pick one with a click.
+- **Private servers.** Paste a private server link (`?privateServerLinkCode=...` or a
+  `roblox.com/share?code=...&type=Server` link) and every account joins it.
 - **Join the main account.** Alts can join the exact server the main account is in, or follow it as a friend.
+- **Named windows.** Each client's window is titled "Roblox - username", so you can tell them apart.
+- **Auto-rejoin.** Every 30 seconds it checks that each launched account is still in game. If one was
+  disconnected or kicked (including the 20-minute idle kick), its client is closed and launched again.
+- **Lighter alts.** Run alt clients at low CPU priority, and minimize them all with one click.
 - **Launch delay.** Waits a set number of seconds between launches so clients don't start all at once.
 - **Kill all.** Closes every running Roblox client.
 

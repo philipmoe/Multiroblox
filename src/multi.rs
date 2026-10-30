@@ -20,6 +20,9 @@ const ERROR_INVALID_HANDLE: DWORD = 6;
 const ERROR_ALREADY_EXISTS: DWORD = 183;
 const PROCESS_TERMINATE: DWORD = 0x0001;
 const PROCESS_DUP_HANDLE: DWORD = 0x0040;
+const PROCESS_SET_INFORMATION: DWORD = 0x0200;
+const NORMAL_PRIORITY_CLASS: DWORD = 0x0020;
+const BELOW_NORMAL_PRIORITY_CLASS: DWORD = 0x4000;
 const DUPLICATE_CLOSE_SOURCE: DWORD = 0x1;
 const DUPLICATE_SAME_ACCESS: DWORD = 0x2;
 const TH32CS_SNAPPROCESS: DWORD = 0x2;
@@ -80,6 +83,7 @@ extern "system" {
     fn Process32FirstW(snap: HANDLE, pe: *mut PROCESSENTRY32W) -> BOOL;
     fn Process32NextW(snap: HANDLE, pe: *mut PROCESSENTRY32W) -> BOOL;
     fn TerminateProcess(h: HANDLE, code: u32) -> BOOL;
+    fn SetPriorityClass(h: HANDLE, class: DWORD) -> BOOL;
 }
 
 #[link(name = "ntdll")]
@@ -330,20 +334,34 @@ pub fn release_in_running_clients() -> usize {
     closed
 }
 
-pub fn kill_all() -> usize {
-    let mut n = 0;
-    for pid in roblox_pids() {
-        unsafe {
-            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if !h.is_null() {
-                if TerminateProcess(h, 0) != 0 {
-                    n += 1;
-                }
-                CloseHandle(h);
-            }
+pub fn kill(pid: u32) -> bool {
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            return false;
         }
+        let ok = TerminateProcess(h, 0) != 0;
+        CloseHandle(h);
+        ok
     }
-    n
+}
+
+pub fn kill_all() -> usize {
+    roblox_pids().into_iter().filter(|&pid| kill(pid)).count()
+}
+
+/// Runs a client at below-normal priority so the main client gets the CPU first.
+pub fn set_low_priority(pid: u32, low: bool) -> bool {
+    let class = if low { BELOW_NORMAL_PRIORITY_CLASS } else { NORMAL_PRIORITY_CLASS };
+    unsafe {
+        let h = OpenProcess(PROCESS_SET_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let ok = SetPriorityClass(h, class) != 0;
+        CloseHandle(h);
+        ok
+    }
 }
 
 pub fn shell_open(uri: &str) -> bool {
@@ -363,14 +381,78 @@ pub fn claim_app_guard() -> bool {
     }
 }
 
+const GW_OWNER: u32 = 4;
+const WM_SETTEXT: u32 = 0x000C;
+const SMTO_ABORTIFHUNG: u32 = 0x2;
+const SW_MINIMIZE: i32 = 6;
+
 #[link(name = "user32")]
 extern "system" {
     fn MessageBoxW(hwnd: HANDLE, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    fn EnumWindows(cb: extern "system" fn(HANDLE, isize) -> BOOL, lparam: isize) -> BOOL;
+    fn GetWindowThreadProcessId(hwnd: HANDLE, pid: *mut DWORD) -> DWORD;
+    fn IsWindowVisible(hwnd: HANDLE) -> BOOL;
+    fn GetWindow(hwnd: HANDLE, cmd: u32) -> HANDLE;
+    fn GetWindowTextW(hwnd: HANDLE, buf: *mut u16, max: i32) -> i32;
+    fn SendMessageTimeoutW(
+        hwnd: HANDLE,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+        flags: u32,
+        timeout_ms: u32,
+        result: *mut usize,
+    ) -> isize;
+    fn ShowWindowAsync(hwnd: HANDLE, cmd: i32) -> BOOL;
 }
 
 pub fn message_box(title: &str, text: &str) {
     let (t, c) = (wide(text), wide(title));
     unsafe { MessageBoxW(null_mut(), t.as_ptr(), c.as_ptr(), 0x40) };
+}
+
+extern "system" fn collect_window(hwnd: HANDLE, lparam: isize) -> BOOL {
+    let (pid, found) = unsafe { &mut *(lparam as *mut (DWORD, Vec<HANDLE>)) };
+    let mut owner = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut owner);
+        if owner == *pid && IsWindowVisible(hwnd) != 0 && GetWindow(hwnd, GW_OWNER).is_null() {
+            found.push(hwnd);
+        }
+    }
+    1
+}
+
+/// Visible top-level windows of a process.
+fn windows_of(pid: u32) -> Vec<HANDLE> {
+    let mut state: (DWORD, Vec<HANDLE>) = (pid, Vec::new());
+    unsafe { EnumWindows(collect_window, &mut state as *mut _ as isize) };
+    state.1
+}
+
+fn window_text(hwnd: HANDLE) -> String {
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// Renames a client's window. Uses a timeout so a client that is still loading can't block us.
+pub fn set_client_title(pid: u32, title: &str) {
+    let w = wide(title);
+    for hwnd in windows_of(pid) {
+        if window_text(hwnd) != title {
+            let mut result = 0usize;
+            unsafe {
+                SendMessageTimeoutW(hwnd, WM_SETTEXT, 0, w.as_ptr() as isize, SMTO_ABORTIFHUNG, 500, &mut result)
+            };
+        }
+    }
+}
+
+pub fn minimize_client(pid: u32) {
+    for hwnd in windows_of(pid) {
+        unsafe { ShowWindowAsync(hwnd, SW_MINIMIZE) };
+    }
 }
 
 #[repr(C)]

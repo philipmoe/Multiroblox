@@ -119,6 +119,8 @@ pub struct Config {
     pub place_id: String,
     pub job_id: String,
     pub delay_secs: u32,
+    pub auto_rejoin: bool,
+    pub low_priority_alts: bool,
 }
 
 impl Default for Config {
@@ -130,6 +132,8 @@ impl Default for Config {
             place_id: String::new(),
             job_id: String::new(),
             delay_secs: 8,
+            auto_rejoin: false,
+            low_priority_alts: false,
         }
     }
 }
