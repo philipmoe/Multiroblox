@@ -87,6 +87,34 @@ pub fn decrypt(hex: &str) -> Option<String> {
     String::from_utf8(take(out)).ok()
 }
 
+/// Which public server a launch goes to when no job ID is given.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
+pub enum ServerPick {
+    /// Let Roblox choose.
+    #[default]
+    Any,
+    /// Low ping in a server that is busy but not packed.
+    Best,
+    LowestPing,
+    Fewest,
+    Most,
+}
+
+impl ServerPick {
+    pub const ALL: [ServerPick; 5] =
+        [ServerPick::Any, ServerPick::Best, ServerPick::LowestPing, ServerPick::Fewest, ServerPick::Most];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ServerPick::Any => "Any (Roblox picks)",
+            ServerPick::Best => "Best (low ping, busy)",
+            ServerPick::LowestPing => "Lowest ping",
+            ServerPick::Fewest => "Fewest players",
+            ServerPick::Most => "Most players",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Account {
     pub user_id: u64,
@@ -115,12 +143,30 @@ impl Account {
 pub struct Config {
     pub accounts: Vec<Account>,
     pub main: Option<u64>,
+    /// The account Home browses and plays as; main when unset.
+    pub home_account: Option<u64>,
     pub selected: Vec<u64>,
     pub place_id: String,
     pub job_id: String,
     pub delay_secs: u32,
+    pub server_pick: ServerPick,
     pub auto_rejoin: bool,
+    /// AFK mode also covers the main account.
+    pub afk_include_main: bool,
+    pub low_graphics: bool,
+    pub fps_cap_on: bool,
+    pub fps_cap: u32,
+    pub cpu_limit_on: bool,
+    /// Percent of the PC's total CPU each AFK client may use.
+    pub cpu_limit: u32,
+    pub mute_alts: bool,
     pub low_priority_alts: bool,
+    pub minimize_alts: bool,
+    pub anti_afk: bool,
+    pub afk_minutes: u32,
+    /// Anti-AFK presses Space (jump); otherwise it nudges the mouse.
+    pub afk_jump: bool,
+    pub keep_awake: bool,
 }
 
 impl Default for Config {
@@ -128,12 +174,26 @@ impl Default for Config {
         Config {
             accounts: Vec::new(),
             main: None,
+            home_account: None,
             selected: Vec::new(),
             place_id: String::new(),
             job_id: String::new(),
             delay_secs: 8,
+            server_pick: ServerPick::Any,
             auto_rejoin: false,
+            afk_include_main: false,
+            low_graphics: false,
+            fps_cap_on: false,
+            fps_cap: 30,
+            cpu_limit_on: false,
+            cpu_limit: 10,
+            mute_alts: false,
             low_priority_alts: false,
+            minimize_alts: false,
+            anti_afk: false,
+            afk_minutes: 15,
+            afk_jump: true,
+            keep_awake: false,
         }
     }
 }

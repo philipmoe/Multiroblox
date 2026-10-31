@@ -1,13 +1,22 @@
 #![windows_subsystem = "windows"]
 
+mod audio;
+mod gamesettings;
+mod history;
+mod home;
+mod imgcache;
+mod logwatch;
 mod jobs;
 mod multi;
 mod roblox;
 mod store;
 
 use eframe::egui::{self, Color32, RichText};
-use jobs::{Acct, Bg, Msg, Watch};
+use history::History;
+use home::HomeState;
+use jobs::{Acct, Bg, HomePart, Msg, Watch};
 use roblox::{Presence, Server, Target};
+use store::ServerPick;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
@@ -19,7 +28,25 @@ const AMBER: Color32 = Color32::from_rgb(235, 180, 70);
 const RED: Color32 = Color32::from_rgb(235, 90, 90);
 const BLUE: Color32 = Color32::from_rgb(110, 170, 240);
 
+/// Frame-rate caps offered for AFK clients. 30 and up match Roblox's own menu; the lower ones
+/// aren't offered by Roblox and may be ignored by the client.
+const FPS_CAPS: [u32; 9] = [1, 5, 10, 15, 30, 60, 120, 144, 240];
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Home,
+    Accounts,
+    Settings,
+}
+
 struct App {
+    tab: Tab,
+    history: History,
+    home: HomeState,
+    /// Avatar headshot URLs of the saved accounts.
+    avatars: HashMap<u64, String>,
+    /// Mirrors the Windows startup entry, which is the real setting.
+    start_with_windows: bool,
     cfg: store::Config,
     held: Vec<multi::Singleton>,
     bg: Bg,
@@ -39,6 +66,7 @@ struct App {
     servers_loading: bool,
     servers_failed: bool,
     fewest_first: bool,
+    awake_applied: bool,
 }
 
 impl App {
@@ -52,13 +80,32 @@ impl App {
             watch: Arc::new(Mutex::new(Watch::default())),
         };
         jobs::start_watcher(&bg);
+        jobs::start_anti_afk(&bg);
+        jobs::start_status_refresh(&bg);
+        logwatch::start(&bg);
+        // Keep the startup entry pointing at this exe, in case it was moved.
+        let start_with_windows = multi::starts_with_windows();
+        if start_with_windows {
+            multi::set_start_with_windows(true);
+        }
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        if std::env::args().any(|a| a == "--startup") {
+            // Started by Windows at sign-in: stay out of the way until opened from the taskbar.
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
 
         // Free the singleton in clients that were started earlier, then claim it for ourselves.
         let freed = multi::release_in_running_clients();
         let held = multi::acquire();
 
         let cfg = store::load();
+        let tab = if cfg.accounts.is_empty() { Tab::Accounts } else { Tab::Home };
         let mut app = App {
+            tab,
+            history: History::load(),
+            home: HomeState::new(),
+            avatars: HashMap::new(),
+            start_with_windows,
             cfg,
             held,
             bg,
@@ -78,11 +125,14 @@ impl App {
             servers_loading: false,
             servers_failed: false,
             fewest_first: false,
+            awake_applied: false,
         };
         if freed > 0 {
             app.say(format!("Released the singleton lock in {freed} running client handle(s)."));
         }
         app.show_add = app.cfg.accounts.is_empty();
+        app.sync_accounts();
+        app.load_avatars();
         let ids: Vec<u64> = app.cfg.accounts.iter().map(|a| a.user_id).collect();
         app.refresh(&ids);
         app
@@ -110,6 +160,17 @@ impl App {
                 None
             }
         }
+    }
+
+    /// Hands every saved account to the background threads (for playtime tracking).
+    fn sync_accounts(&mut self) {
+        let list = self
+            .cfg
+            .accounts
+            .iter()
+            .filter_map(|a| Some(Acct { id: a.user_id, name: a.username.clone(), cookie: a.cookie_plain()? }))
+            .collect();
+        self.bg.watch().accounts = list;
     }
 
     fn accts(&mut self, ids: &[u64]) -> Vec<Acct> {
@@ -169,6 +230,74 @@ impl App {
         self.bg.watch().clients.iter().filter(|(id, _)| Some(**id) != main).map(|(_, c)| c.pid).collect()
     }
 
+    fn count_clients(&mut self) {
+        self.clients = multi::roblox_pids().len();
+        self.last_poll = Instant::now();
+    }
+
+    /// Makes an account main. Main is never also an alt.
+    fn set_main(&mut self, id: u64) {
+        self.cfg.main = Some(id);
+        self.cfg.selected.retain(|x| *x != id);
+        self.dirty = true;
+        if let Some(a) = self.cfg.accounts.iter().find(|a| a.user_id == id) {
+            let name = a.username.clone();
+            self.say(format!("{name} is now the main account."));
+        }
+    }
+
+    fn load_avatars(&mut self) {
+        let ids: Vec<u64> = self.cfg.accounts.iter().map(|a| a.user_id).collect();
+        let Some(&first) = ids.first() else { return };
+        if let Some(a) = self.acct(first) {
+            jobs::load_avatars(&self.bg, a, ids);
+        }
+    }
+
+    /// Closes one account's client. It is untracked first so auto-rejoin doesn't bring it back.
+    fn stop_client(&mut self, id: u64, name: &str) {
+        let pid = self.bg.watch().clients.remove(&id).map(|c| c.pid);
+        let stopped = pid.is_some_and(multi::kill);
+        self.count_clients();
+        match pid {
+            Some(_) if stopped => self.say(format!("Stopped {name}'s client.")),
+            Some(_) => self.say(format!("{name}: could not close its client.")),
+            None => self.say(format!("{name} has no client running from here.")),
+        }
+    }
+
+    /// Closes every alt client started from here and leaves main running.
+    fn stop_alts(&mut self) {
+        let main = self.cfg.main;
+        let pids: Vec<u32> = {
+            let mut w = self.bg.watch();
+            let ids: Vec<u64> = w.clients.keys().copied().filter(|id| Some(*id) != main).collect();
+            ids.iter().filter_map(|id| w.clients.remove(id)).map(|c| c.pid).collect()
+        };
+        let n = pids.into_iter().filter(|&pid| multi::kill(pid)).count();
+        self.count_clients();
+        self.say(format!("Stopped {n} alt client(s)."));
+    }
+
+    fn settings(&self) -> jobs::Settings {
+        let c = &self.cfg;
+        jobs::Settings {
+            main: c.main,
+            server_pick: c.server_pick,
+            include_main: c.afk_include_main,
+            low_graphics: c.low_graphics,
+            fps_cap: c.fps_cap_on.then_some(c.fps_cap),
+            cpu_limit: c.cpu_limit_on.then_some(c.cpu_limit),
+            mute: c.mute_alts,
+            low_priority: c.low_priority_alts,
+            minimize: c.minimize_alts,
+            auto_rejoin: c.auto_rejoin,
+            anti_afk: c.anti_afk,
+            afk_minutes: c.afk_minutes,
+            afk_jump: c.afk_jump,
+        }
+    }
+
     fn pump(&mut self) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
@@ -187,6 +316,8 @@ impl App {
                     self.adding = false;
                     self.cookie_input.clear();
                     self.save();
+                    self.sync_accounts();
+                    self.load_avatars();
                     self.refresh(&[id]);
                 }
                 Msg::AddFailed => self.adding = false,
@@ -202,6 +333,26 @@ impl App {
                     self.servers_failed = list.is_none();
                     self.servers = list.unwrap_or_default();
                 }
+                Msg::Launched(place) => {
+                    self.history.launched(place);
+                    self.history.save();
+                }
+                Msg::Played { user, place, universe, name, secs } => {
+                    self.history.add_time(place, universe, &name, user, secs);
+                    self.history.save();
+                }
+                Msg::Home { account, part } => {
+                    if let HomePart::Continue(Ok(games)) = &part {
+                        for g in games {
+                            self.history.set_meta(g.place, g.universe, &g.name);
+                        }
+                        self.history.save();
+                    }
+                    if let Some(e) = self.home.receive(account, part) {
+                        self.say(e);
+                    }
+                }
+                Msg::Avatars(found) => self.avatars.extend(found),
             }
         }
     }
@@ -224,6 +375,7 @@ impl App {
                 if ui.button("Kill all").on_hover_text("Close every running Roblox client").clicked() {
                     self.bg.watch().clients.clear();
                     let n = multi::kill_all();
+                    self.count_clients();
                     self.say(format!("Closed {n} client(s)."));
                 }
                 if ui
@@ -235,6 +387,9 @@ impl App {
                     let n = multi::release_in_running_clients();
                     self.held = multi::acquire();
                     self.say(format!("Released {n} handle(s)."));
+                }
+                if ui.button("Stop alts").on_hover_text("Close the alt clients started from here; main keeps running").clicked() {
+                    self.stop_alts();
                 }
                 if ui.button("Minimize alts").on_hover_text("Minimize the alt clients started from here").clicked() {
                     let pids = self.alt_client_pids();
@@ -269,31 +424,48 @@ impl App {
         });
         let b = ui.add(egui::TextEdit::singleline(&mut self.cfg.job_id).desired_width(f32::INFINITY));
         self.dirty |= a.changed() || b.changed();
+        ui.horizontal(|ui| {
+            ui.label("Server").on_hover_text(
+                "Which public server to join when the Job ID is empty. Ping is the average of the \
+                 players already in the server, so treat \"Lowest ping\" as a good guess.",
+            );
+            egui::ComboBox::from_id_salt("server_pick")
+                .selected_text(self.cfg.server_pick.label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for p in ServerPick::ALL {
+                        self.dirty |= ui.selectable_value(&mut self.cfg.server_pick, p, p.label()).changed();
+                    }
+                });
+        });
         if browse {
             self.load_servers();
         }
-        ui.horizontal(|ui| {
-            ui.label("Delay between launches");
-            let d = ui.add(egui::DragValue::new(&mut self.cfg.delay_secs).range(0..=120).suffix(" s"));
-            self.dirty |= d.changed();
-        });
-        let r = ui.checkbox(&mut self.cfg.auto_rejoin, "Auto-rejoin dropped accounts").on_hover_text(
-            "Every 30 s, checks each client launched from here. If its account is no longer in game \
-             (disconnected, kicked, or the 20-minute idle kick), the client is closed and launched again.",
-        );
-        let l = ui
-            .checkbox(&mut self.cfg.low_priority_alts, "Low CPU priority for alts")
-            .on_hover_text("Alt clients run at below-normal priority so the main client stays smooth.");
-        self.dirty |= r.changed() || l.changed();
         ui.add_space(6.0);
         ui.separator();
 
         let main = self.cfg.main.and_then(|id| self.cfg.accounts.iter().find(|a| a.user_id == id));
         let main_name = main.map(|a| a.username.clone());
-        match &main_name {
-            Some(n) => ui.label(RichText::new(format!("Main: {n}")).strong()),
-            None => ui.colored_label(AMBER, "No main account - mark one in the list"),
-        };
+        let choices: Vec<(u64, String)> =
+            self.cfg.accounts.iter().map(|a| (a.user_id, format!("{} (@{})", a.title(), a.username))).collect();
+        let mut new_main = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Main").strong().color(AMBER));
+            let shown = main.map(|a| a.title().to_string()).unwrap_or_else(|| "Pick an account".into());
+            egui::ComboBox::from_id_salt("main_pick")
+                .selected_text(shown)
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for (id, label) in &choices {
+                        if ui.selectable_label(self.cfg.main == Some(*id), label).clicked() {
+                            new_main = Some(*id);
+                        }
+                    }
+                });
+        });
+        if let Some(id) = new_main {
+            self.set_main(id);
+        }
         let alts = self.alt_ids();
         ui.label(format!("{} alt(s) selected", alts.len()));
         ui.add_space(6.0);
@@ -377,9 +549,139 @@ impl App {
         ui.add_space(6.0);
     }
 
+    fn tabs(&mut self, ui: &mut egui::Ui) {
+        ui.selectable_value(&mut self.tab, Tab::Home, RichText::new("Home").heading());
+        ui.selectable_value(&mut self.tab, Tab::Accounts, RichText::new("Accounts").heading());
+        ui.selectable_value(&mut self.tab, Tab::Settings, RichText::new("Settings").heading());
+    }
+
+    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| self.tabs(ui));
+        ui.add_space(4.0);
+        let mut changed = false;
+        let mut startup_failed = false;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let c = &mut self.cfg;
+            ui.label(RichText::new("AFK mode").strong());
+            ui.label(
+                RichText::new("Applies to alts. Graphics and FPS take effect on the next launch, the rest right away.")
+                    .weak()
+                    .small(),
+            );
+            ui.add_space(2.0);
+            changed |= ui
+                .checkbox(&mut c.afk_include_main, "Include main")
+                .on_hover_text("Also apply AFK mode to the main account.")
+                .changed();
+            changed |= ui
+                .checkbox(&mut c.low_graphics, "Lowest graphics")
+                .on_hover_text("Launch with graphics quality 1. Your own setting comes back for clients that aren't AFK.")
+                .changed();
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .checkbox(&mut c.fps_cap_on, "FPS cap")
+                    .on_hover_text(
+                        "Launch with a frame-rate limit to save CPU and GPU. Roblox's own menu stops at 30, \
+                         so 1-15 may be ignored - check with Shift+F5 in the client.",
+                    )
+                    .changed();
+                ui.add_enabled_ui(c.fps_cap_on, |ui| {
+                    egui::ComboBox::from_id_salt("fps_cap").selected_text(format!("{} FPS", c.fps_cap)).show_ui(ui, |ui| {
+                        for v in FPS_CAPS {
+                            changed |= ui.selectable_value(&mut c.fps_cap, v, format!("{v} FPS")).changed();
+                        }
+                    });
+                });
+            });
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .checkbox(&mut c.cpu_limit_on, "CPU limit")
+                    .on_hover_text(
+                        "Windows caps how much of the PC's total CPU each client may use. Works right away. \
+                         Too low can make Roblox lag so badly it disconnects - start around 10% and lower carefully.",
+                    )
+                    .changed();
+                ui.add_enabled_ui(c.cpu_limit_on, |ui| {
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut c.cpu_limit).range(1..=50).suffix("% per client"))
+                        .changed();
+                });
+            });
+            changed |= ui
+                .checkbox(&mut c.mute_alts, "Mute")
+                .on_hover_text("Mutes the client in the Windows volume mixer.")
+                .changed();
+            changed |= ui
+                .checkbox(&mut c.low_priority_alts, "Low CPU priority")
+                .on_hover_text("Runs the client at below-normal priority so anything else you do stays smooth.")
+                .changed();
+            changed |= ui
+                .checkbox(&mut c.minimize_alts, "Minimize after launch")
+                .on_hover_text("Minimizes the window about 15 seconds after it opens.")
+                .changed();
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(RichText::new("Staying in game").strong());
+            ui.add_space(2.0);
+            changed |= ui
+                .checkbox(&mut c.anti_afk, "Anti-AFK")
+                .on_hover_text(
+                    "Every few minutes, briefly brings each Roblox window to the front and presses Space or \
+                     nudges the mouse, so the 20-minute idle kick never happens. Waits for a pause in your \
+                     typing and puts your window back afterwards. Doesn't work while the PC is locked.",
+                )
+                .changed();
+            ui.add_enabled_ui(c.anti_afk, |ui| {
+                ui.indent("anti_afk", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Every");
+                        changed |= ui.add(egui::DragValue::new(&mut c.afk_minutes).range(1..=16).suffix(" min")).changed();
+                    });
+                    ui.horizontal(|ui| {
+                        changed |= ui.radio_value(&mut c.afk_jump, true, "Jump (Space)").changed();
+                        changed |= ui.radio_value(&mut c.afk_jump, false, "Mouse nudge").changed();
+                    });
+                });
+            });
+            changed |= ui
+                .checkbox(&mut c.auto_rejoin, "Auto-rejoin dropped accounts")
+                .on_hover_text(
+                    "Every 30 s, checks each client launched from here. If its account is no longer in game \
+                     (disconnected, kicked, or the 20-minute idle kick), the client is closed and launched again.",
+                )
+                .changed();
+            changed |= ui
+                .checkbox(&mut c.keep_awake, "Keep PC awake")
+                .on_hover_text("Stops Windows from going to sleep while Multi Roblox is open. The screen can still turn off.")
+                .changed();
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(RichText::new("Launching").strong());
+            ui.add_space(2.0);
+            let sw = ui
+                .checkbox(&mut self.start_with_windows, "Start with Windows")
+                .on_hover_text("Opens Multi Roblox minimized when you sign in to Windows.");
+            if sw.changed() && !multi::set_start_with_windows(self.start_with_windows) {
+                self.start_with_windows = multi::starts_with_windows();
+                startup_failed = true;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Delay between launches");
+                changed |= ui.add(egui::DragValue::new(&mut c.delay_secs).range(0..=120).suffix(" s")).changed();
+            });
+        });
+        self.dirty |= changed;
+        if startup_failed {
+            self.say("Could not change the Windows startup entry.");
+        }
+    }
+
     fn accounts_panel(&mut self, ui: &mut egui::Ui) {
+        let running: HashSet<u64> = self.bg.watch().clients.keys().copied().collect();
         ui.horizontal(|ui| {
-            ui.heading("Accounts");
+            self.tabs(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let label = if self.show_add { "Hide add" } else { "Add account" };
                 if ui.button(label).clicked() {
@@ -413,28 +715,25 @@ impl App {
             for a in &accounts {
                 let id = a.user_id;
                 let is_main = self.cfg.main == Some(id);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
+                let mut frame = egui::Frame::group(ui.style());
+                if is_main {
+                    frame = frame.stroke(egui::Stroke::new(1.5, AMBER));
+                }
+                frame.show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        if ui
-                            .selectable_label(is_main, "Main")
-                            .on_hover_text("Make this the main account")
-                            .clicked()
-                        {
-                            self.cfg.main = if is_main { None } else { Some(id) };
-                            self.dirty = true;
-                        }
-                        let mut sel = self.cfg.selected.contains(&id);
-                        if ui.add_enabled(!is_main, egui::Checkbox::new(&mut sel, "Alt")).changed() {
-                            if sel {
-                                self.cfg.selected.push(id);
-                            } else {
-                                self.cfg.selected.retain(|x| *x != id);
-                            }
-                            self.dirty = true;
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 18.0, ui.visuals().extreme_bg_color);
+                        if let Some(url) = self.avatars.get(&id) {
+                            egui::Image::new(self.home.images.uri(url)).corner_radius(18.0).paint_at(ui, rect);
                         }
                         ui.vertical(|ui| {
-                            ui.label(RichText::new(a.title()).strong());
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(a.title()).strong());
+                                if is_main {
+                                    ui.label(RichText::new("MAIN").small().strong().color(AMBER));
+                                }
+                            });
                             let (text, color) = if self.expired.contains(&id) {
                                 ("Session expired - re-add".to_string(), RED)
                             } else {
@@ -462,6 +761,7 @@ impl App {
                                     self.presence.remove(&id);
                                     self.confirm_remove = None;
                                     self.dirty = true;
+                                    self.sync_accounts();
                                 } else {
                                     self.confirm_remove = Some(id);
                                 }
@@ -472,6 +772,25 @@ impl App {
                             if ui.button("Launch").on_hover_text("Launch just this account into the game").clicked() {
                                 if let (Some(t), Some(acct)) = (self.target(), self.acct(id)) {
                                     jobs::launch_many(&self.bg, vec![acct], t, 0);
+                                }
+                            }
+                            if running.contains(&id)
+                                && ui.button("Stop").on_hover_text("Close this account's Roblox client").clicked()
+                            {
+                                self.stop_client(id, &a.username);
+                            }
+                            if !is_main {
+                                let mut sel = self.cfg.selected.contains(&id);
+                                if ui.checkbox(&mut sel, "Alt").on_hover_text("Include in alt launches").changed() {
+                                    if sel {
+                                        self.cfg.selected.push(id);
+                                    } else {
+                                        self.cfg.selected.retain(|x| *x != id);
+                                    }
+                                    self.dirty = true;
+                                }
+                                if ui.button("Make main").clicked() {
+                                    self.set_main(id);
                                 }
                             }
                         });
@@ -550,17 +869,15 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump();
-        {
-            let mut w = self.bg.watch();
-            w.auto_rejoin = self.cfg.auto_rejoin;
-            w.low_priority_alts = self.cfg.low_priority_alts;
-            w.main = self.cfg.main;
+        self.bg.watch().settings = self.settings();
+        if self.cfg.keep_awake != self.awake_applied {
+            multi::keep_awake(self.cfg.keep_awake);
+            self.awake_applied = self.cfg.keep_awake;
         }
-        if self.last_poll.elapsed() > Duration::from_secs(2) {
-            self.clients = multi::roblox_pids().len();
-            self.last_poll = Instant::now();
+        if self.last_poll.elapsed() >= Duration::from_secs(1) {
+            self.count_clients();
         }
-        ctx.request_repaint_after(Duration::from_secs(2));
+        ctx.request_repaint_after(Duration::from_secs(1));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -575,8 +892,10 @@ impl eframe::App for App {
         egui::Panel::right("game").resizable(false).exact_size(290.0).show(ui, |ui| {
             self.game_panel(ui);
         });
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.accounts_panel(ui);
+        egui::CentralPanel::default().show(ui, |ui| match self.tab {
+            Tab::Home => self.home_panel(ui),
+            Tab::Accounts => self.accounts_panel(ui),
+            Tab::Settings => self.settings_panel(ui),
         });
         let ctx = ui.ctx().clone();
         self.servers_window(&ctx);

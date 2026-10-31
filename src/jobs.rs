@@ -1,9 +1,10 @@
 //! Background work. Everything that touches the network or waits runs here so the UI never blocks;
 //! results come back to the UI as `Msg` values.
 
-use crate::multi;
-use crate::roblox::{self, ApiError, Presence, Server, Target};
-use crate::store::{self, Account};
+use crate::gamesettings::{self, Profile};
+use crate::roblox::{self, ApiError, FriendGame, Game, Presence, Server, Target};
+use crate::store::{self, Account, ServerPick};
+use crate::{audio, multi};
 use eframe::egui;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +19,14 @@ const CHECK_EVERY: Duration = Duration::from_secs(30);
 const LOAD_GRACE: Duration = Duration::from_secs(180);
 /// Rejoins in a row that may fail before the watcher gives up on an account.
 const MAX_ATTEMPTS: u8 = 3;
+/// How long anti-AFK may hold off while the user is typing before it nudges anyway.
+const AFK_MAX_WAIT: Duration = Duration::from_secs(180);
+/// How long "minimize after launch" waits, so the client is past its splash screen.
+const MINIMIZE_AFTER: Duration = Duration::from_secs(15);
+/// How long a client gets to read the graphics settings before the next launch may rewrite them.
+const SETTINGS_READ_TIME: Duration = Duration::from_secs(4);
+/// How often every saved account's status is refreshed.
+const STATUS_EVERY: Duration = Duration::from_secs(60);
 
 pub enum Msg {
     Log(String),
@@ -27,6 +36,23 @@ pub enum Msg {
     Expired(u64),
     /// Public servers for the server picker; `None` when the lookup failed.
     Servers(Option<Vec<Server>>),
+    /// A launch into this root place started.
+    Launched(u64),
+    /// An account was seen in a game; `secs` is the time since the last look.
+    Played { user: u64, place: u64, universe: Option<u64>, name: String, secs: u64 },
+    /// A Home row, loaded as `account`.
+    Home { account: u64, part: HomePart },
+    /// Avatar headshot URLs of the saved accounts.
+    Avatars(HashMap<u64, String>),
+}
+
+/// One row of the Home page, or why it couldn't load.
+pub enum HomePart {
+    Continue(Result<Vec<Game>, String>),
+    Favorites(Result<Vec<Game>, String>),
+    Friends(Result<Vec<FriendGame>, String>),
+    Charts(Result<Vec<(String, Vec<Game>)>, String>),
+    Search(Result<Vec<Game>, String>),
 }
 
 #[derive(Clone)]
@@ -60,6 +86,10 @@ impl Bg {
     pub fn watch(&self) -> MutexGuard<'_, Watch> {
         self.watch.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn settings(&self) -> Settings {
+        self.watch().settings.clone()
+    }
 }
 
 /// An account with its cookie already decrypted, ready to be moved onto a worker thread.
@@ -70,13 +100,43 @@ pub struct Acct {
     pub cookie: String,
 }
 
-/// Clients this app started, keyed by account, plus the settings the watcher follows.
+/// Clients this app started, keyed by account, plus the settings the background threads follow.
 #[derive(Default)]
 pub struct Watch {
     pub clients: HashMap<u64, Client>,
-    pub auto_rejoin: bool,
-    pub low_priority_alts: bool,
+    pub settings: Settings,
+    /// Every saved account, for status refreshes. The UI refreshes it when accounts change.
+    pub accounts: Vec<Acct>,
+}
+
+/// The user's settings as the background threads need them; the UI copies them in every frame.
+#[derive(Clone, Default)]
+pub struct Settings {
     pub main: Option<u64>,
+    pub server_pick: ServerPick,
+    pub include_main: bool,
+    pub low_graphics: bool,
+    pub fps_cap: Option<u32>,
+    /// Percent of the PC's total CPU each AFK client may use.
+    pub cpu_limit: Option<u32>,
+    pub mute: bool,
+    pub low_priority: bool,
+    pub minimize: bool,
+    pub auto_rejoin: bool,
+    pub anti_afk: bool,
+    pub afk_minutes: u32,
+    pub afk_jump: bool,
+}
+
+impl Settings {
+    /// AFK mode covers every alt, and the main account only with "include main".
+    pub fn afk_applies(&self, id: u64) -> bool {
+        self.include_main || Some(id) != self.main
+    }
+
+    fn profile(&self) -> Profile {
+        Profile { low_graphics: self.low_graphics, fps_cap: self.fps_cap }
+    }
 }
 
 /// A running client and what is needed to bring its account back after a disconnect.
@@ -91,6 +151,11 @@ pub struct Client {
     attempts: u8,
     rejoining: bool,
     low_priority: Option<bool>,
+    muted: bool,
+    minimized: bool,
+    cpu_job: Option<multi::CpuLimit>,
+    /// The CPU limit last applied (`Some(None)` = explicitly unlimited), or `None` if never touched.
+    cpu_applied: Option<Option<u32>>,
 }
 
 /// Launches are serialised: Roblox's launcher trips over itself when started several times at once.
@@ -165,6 +230,30 @@ fn resolve(bg: &Bg, a: &Acct, target: Target) -> Option<Target> {
     }
 }
 
+/// With a server pick mode set and no job ID given, chooses the public server to launch into.
+fn pick_server(bg: &Bg, a: &Acct, target: Target, need: usize, pick: ServerPick) -> Target {
+    let Target::Place { place, job: None } = target else {
+        return target;
+    };
+    match roblox::pick_server(&a.cookie, place, pick, need as u32) {
+        Ok(Some(s)) => {
+            let ping = s.ping.map_or(String::new(), |p| format!(", {p} ms"));
+            bg.log(format!("{}: picked a server with {}/{} players{ping}.", pick.label(), s.playing, s.max));
+            Target::Place { place, job: Some(s.id) }
+        }
+        Ok(None) => {
+            if pick != ServerPick::Any {
+                bg.log(format!("{}: no server with room for {need} found - Roblox will pick one.", pick.label()));
+            }
+            Target::Place { place, job: None }
+        }
+        Err(e) => {
+            bg.log(format!("Server pick failed ({e}) - Roblox will pick one."));
+            Target::Place { place, job: None }
+        }
+    }
+}
+
 /// Waits for the client a launch just started. Launches are serialised, so the first new
 /// process belongs to the account that was launched.
 fn new_client(bg: &Bg, before: &[u32]) -> Option<u32> {
@@ -199,17 +288,32 @@ fn track(bg: &Bg, a: &Acct, pid: u32, target: &Target) {
             attempts,
             rejoining: false,
             low_priority: None,
+            muted: false,
+            minimized: false,
+            cpu_job: None,
+            cpu_applied: None,
         },
     );
 }
 
 fn launch_one(bg: &Bg, a: &Acct, target: &Target) -> bool {
+    let s = bg.settings();
+    let profile = s.profile();
+    gamesettings::prepare((profile.any() && s.afk_applies(a.id)).then_some(&profile));
     let before = multi::roblox_pids();
     match roblox::launch(&a.cookie, target) {
         Ok(()) => {
             bg.log(format!("Launching {}...", a.name));
+            if let Target::Place { place, .. } | Target::Private { place, .. } = target {
+                bg.send(Msg::Launched(*place));
+            }
             match new_client(bg, &before) {
-                Some(pid) => track(bg, a, pid, target),
+                Some(pid) => {
+                    track(bg, a, pid, target);
+                    if profile.any() {
+                        thread::sleep(SETTINGS_READ_TIME);
+                    }
+                }
                 None => bg.log(format!(
                     "{}: could not find the new client, so it won't be renamed or rejoined.",
                     a.name
@@ -242,11 +346,25 @@ fn launch_all(bg: &Bg, list: &[Acct], target: &Target, delay: u32) {
 }
 
 pub fn launch_many(bg: &Bg, list: Vec<Acct>, target: Target, delay: u32) {
+    let pick = bg.settings().server_pick;
+    launch_picked(bg, list, target, delay, pick);
+}
+
+/// The Home cards' Play button: one account into the best-scoring server of a game.
+pub fn smart_play(bg: &Bg, a: Acct, place: u64) {
+    launch_picked(bg, vec![a], Target::Place { place, job: None }, 0, ServerPick::Best);
+}
+
+fn launch_picked(bg: &Bg, list: Vec<Acct>, target: Target, delay: u32, pick: ServerPick) {
     bg.spawn(move |bg| {
         let _g = lock_launches();
-        let Some(target) = list.first().and_then(|a| resolve(bg, a, target)) else {
+        let Some(first) = list.first() else {
             return;
         };
+        let Some(target) = resolve(bg, first, target) else {
+            return;
+        };
+        let target = pick_server(bg, first, target, list.len(), pick);
         launch_all(bg, &list, &target, delay);
     });
 }
@@ -271,6 +389,7 @@ pub fn join_main(
             let Some(t) = resolve(bg, &main, t) else {
                 return;
             };
+            let t = pick_server(bg, &main, t, 1 + alts.len(), bg.settings().server_pick);
             if !launch_one(bg, &main, &t) {
                 return;
             }
@@ -326,7 +445,8 @@ pub fn join_main(
 }
 
 /// Starts the thread that looks after launched clients: it names their windows after the account,
-/// sets alt priority and, with auto-rejoin on, relaunches accounts that drop out of their game.
+/// applies AFK mode (mute, priority, minimize) and, with auto-rejoin on, relaunches accounts that
+/// drop out of their game.
 pub fn start_watcher(bg: &Bg) {
     let bg = bg.clone();
     thread::spawn(move || loop {
@@ -335,14 +455,150 @@ pub fn start_watcher(bg: &Bg) {
     });
 }
 
+/// Starts the anti-AFK loop: every few minutes each Roblox window gets a short key press or mouse
+/// nudge, which resets Roblox's idle timer before its 20-minute kick.
+pub fn start_anti_afk(bg: &Bg) {
+    let bg = bg.clone();
+    thread::spawn(move || {
+        let mut last = Instant::now();
+        loop {
+            thread::sleep(Duration::from_secs(5));
+            let s = bg.settings();
+            if !s.anti_afk {
+                last = Instant::now();
+                continue;
+            }
+            let every = Duration::from_secs(s.afk_minutes.max(1) as u64 * 60);
+            if last.elapsed() < every {
+                continue;
+            }
+            // Wait for a pause in the user's own typing so focus isn't pulled away mid-word, but
+            // never so long that the idle kick could land first.
+            if multi::user_idle_secs() < 5 && last.elapsed() < every + AFK_MAX_WAIT {
+                continue;
+            }
+            last = Instant::now();
+            let pids = multi::roblox_pids();
+            if pids.is_empty() {
+                continue;
+            }
+            let n = multi::nudge_clients(&pids, s.afk_jump);
+            if n == 0 {
+                bg.log("Anti-AFK: could not bring any Roblox window to the front (is the PC locked?).");
+            } else {
+                bg.log(format!("Anti-AFK: nudged {n} window(s)."));
+            }
+        }
+    });
+}
+
+/// Keeps every saved account's status fresh: once a minute each account's presence is checked.
+/// (Playtime comes from Roblox's log files instead; see `logwatch`.)
+pub fn start_status_refresh(bg: &Bg) {
+    let bg = bg.clone();
+    thread::spawn(move || loop {
+        thread::sleep(STATUS_EVERY);
+        let accounts = bg.watch().accounts.clone();
+        for a in accounts {
+            if let Ok(p) = roblox::presence(&a.cookie, a.id) {
+                bg.send(Msg::Presence(a.id, p));
+            }
+        }
+    });
+}
+
+/// Loads the Home page rows, each on its own thread so a slow row doesn't hold up the others.
+/// `recent` is the local history as (root place, universe if known), newest first.
+pub fn load_home(bg: &Bg, a: Acct, recent: Vec<(u64, Option<u64>)>) {
+    let err = |e: ApiError| e.to_string();
+    let account = a.id;
+
+    let acct = a.clone();
+    bg.spawn(move |bg| {
+        let mut universes = Vec::new();
+        for (place, universe) in recent {
+            match universe {
+                Some(u) => universes.push(u),
+                None => universes.extend(roblox::universe_of(&acct.cookie, place).ok()),
+            }
+        }
+        let result = roblox::game_details(&acct.cookie, &universes).map(|mut games| {
+            // Roblox's own list adds games played outside this app.
+            for g in roblox::continue_list(&acct.cookie).unwrap_or_default() {
+                if !games.iter().any(|x| x.universe == g.universe) {
+                    games.push(g);
+                }
+            }
+            roblox::enrich(&acct.cookie, &mut games);
+            games
+        });
+        bg.send(Msg::Home { account, part: HomePart::Continue(result.map_err(err)) });
+    });
+
+    let acct = a.clone();
+    bg.spawn(move |bg| {
+        let result = roblox::favorites(&acct.cookie, acct.id).map(|mut games| {
+            roblox::enrich(&acct.cookie, &mut games);
+            games
+        });
+        bg.send(Msg::Home { account, part: HomePart::Favorites(result.map_err(err)) });
+    });
+
+    let acct = a.clone();
+    bg.spawn(move |bg| {
+        let result = roblox::friends_playing(&acct.cookie, acct.id);
+        bg.send(Msg::Home { account, part: HomePart::Friends(result.map_err(err)) });
+    });
+
+    bg.spawn(move |bg| {
+        let result = roblox::charts(&a.cookie).map(|mut rows| {
+            for (_, games) in rows.iter_mut() {
+                roblox::enrich(&a.cookie, games);
+            }
+            rows
+        });
+        bg.send(Msg::Home { account, part: HomePart::Charts(result.map_err(err)) });
+    });
+}
+
+pub fn search_games(bg: &Bg, a: Acct, query: String) {
+    bg.spawn(move |bg| {
+        let result = roblox::search(&a.cookie, &query).map(|mut games| {
+            roblox::enrich(&a.cookie, &mut games);
+            games
+        });
+        bg.send(Msg::Home { account: a.id, part: HomePart::Search(result.map_err(|e| e.to_string())) });
+    });
+}
+
+pub fn load_avatars(bg: &Bg, a: Acct, ids: Vec<u64>) {
+    bg.spawn(move |bg| {
+        let found = roblox::headshots(&a.cookie, &ids);
+        if !found.is_empty() {
+            bg.send(Msg::Avatars(found));
+        }
+    });
+}
+
+/// What one tick does to one client, worked out under the lock and carried out after it.
+struct Upkeep {
+    id: u64,
+    pid: u32,
+    title: String,
+    priority: Option<bool>,
+    mute: Option<bool>,
+    minimize: bool,
+}
+
 fn tick(bg: &Bg) {
     let alive = multi::roblox_pids();
     let mut closed = Vec::new();
-    let mut windows = Vec::new();
+    let mut failed_cpu = Vec::new();
+    let mut work = Vec::new();
     let mut due = Vec::new();
     {
         let mut w = bg.watch();
-        let (low_alts, main, rejoin) = (w.low_priority_alts, w.main, w.auto_rejoin);
+        let s = w.settings.clone();
         w.clients.retain(|_, c| {
             let keep = c.rejoining || alive.contains(&c.pid);
             if !keep {
@@ -350,17 +606,41 @@ fn tick(bg: &Bg) {
             }
             keep
         });
-        for (id, c) in w.clients.iter_mut() {
+        for (&id, c) in w.clients.iter_mut() {
             if c.rejoining {
                 continue;
             }
-            let low = low_alts && Some(*id) != main;
+            let afk = s.afk_applies(id);
+            let low = s.low_priority && afk;
             let priority = (c.low_priority != Some(low)).then(|| {
                 c.low_priority = Some(low);
                 low
             });
-            windows.push((c.pid, format!("Roblox - {}", c.acct.name), priority));
-            if rejoin && c.last_check.elapsed() >= CHECK_EVERY {
+            // Keep muting so sound that starts later is caught; only ever unmute what we muted.
+            let mute = if s.mute && afk {
+                c.muted = true;
+                Some(true)
+            } else if c.muted {
+                c.muted = false;
+                Some(false)
+            } else {
+                None
+            };
+            let cpu = s.cpu_limit.filter(|_| afk);
+            if c.cpu_applied != Some(cpu) && (cpu.is_some() || c.cpu_job.is_some()) {
+                c.cpu_applied = Some(cpu);
+                if c.cpu_job.is_none() {
+                    c.cpu_job = multi::CpuLimit::attach(c.pid);
+                }
+                let ok = c.cpu_job.as_ref().is_some_and(|j| j.set(cpu));
+                if !ok {
+                    failed_cpu.push(c.acct.name.clone());
+                }
+            }
+            let minimize = s.minimize && afk && !c.minimized && c.launched.elapsed() >= MINIMIZE_AFTER;
+            let title = format!("Roblox - {}", c.acct.name);
+            work.push(Upkeep { id, pid: c.pid, title, priority, mute, minimize });
+            if s.auto_rejoin && c.last_check.elapsed() >= CHECK_EVERY {
                 c.last_check = Instant::now();
                 due.push(c.acct.clone());
             }
@@ -369,13 +649,37 @@ fn tick(bg: &Bg) {
     for name in closed {
         bg.log(format!("{name}'s client closed."));
     }
-    // Window and process calls happen outside the lock so a busy client can't stall the UI.
-    for (pid, title, priority) in windows {
-        multi::set_client_title(pid, &title);
-        if let Some(low) = priority {
-            multi::set_low_priority(pid, low);
+    for name in failed_cpu {
+        bg.log(format!("{name}: could not change the CPU limit on its client."));
+    }
+
+    // Window, process and audio calls happen outside the lock so a busy client can't stall the UI.
+    let mut mutes = Vec::new();
+    let mut minimized = Vec::new();
+    for u in work {
+        multi::set_client_title(u.pid, &u.title);
+        if let Some(low) = u.priority {
+            multi::set_low_priority(u.pid, low);
+        }
+        if let Some(m) = u.mute {
+            mutes.push((u.pid, m));
+        }
+        if u.minimize && multi::minimize_client(u.pid) > 0 {
+            minimized.push(u.id);
         }
     }
+    if !mutes.is_empty() {
+        audio::set_mute(&mutes);
+    }
+    if !minimized.is_empty() {
+        let mut w = bg.watch();
+        for id in minimized {
+            if let Some(c) = w.clients.get_mut(&id) {
+                c.minimized = true;
+            }
+        }
+    }
+
     for a in due {
         check(bg, a);
     }
@@ -401,7 +705,7 @@ fn check(bg: &Bg, a: Acct) {
     };
 
     let mut w = bg.watch();
-    if !w.auto_rejoin {
+    if !w.settings.auto_rejoin {
         return;
     }
     let Some(c) = w.clients.get_mut(&a.id) else {

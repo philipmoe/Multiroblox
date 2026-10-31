@@ -21,6 +21,16 @@ const ERROR_ALREADY_EXISTS: DWORD = 183;
 const PROCESS_TERMINATE: DWORD = 0x0001;
 const PROCESS_DUP_HANDLE: DWORD = 0x0040;
 const PROCESS_SET_INFORMATION: DWORD = 0x0200;
+const PROCESS_SET_QUOTA: DWORD = 0x0100;
+const JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION_CLASS: i32 = 15;
+const JOB_OBJECT_CPU_RATE_CONTROL_ENABLE: u32 = 0x1;
+const JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP: u32 = 0x4;
+
+#[repr(C)]
+struct JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+    flags: u32,
+    rate: u32,
+}
 const NORMAL_PRIORITY_CLASS: DWORD = 0x0020;
 const BELOW_NORMAL_PRIORITY_CLASS: DWORD = 0x4000;
 const DUPLICATE_CLOSE_SOURCE: DWORD = 0x1;
@@ -84,6 +94,9 @@ extern "system" {
     fn Process32NextW(snap: HANDLE, pe: *mut PROCESSENTRY32W) -> BOOL;
     fn TerminateProcess(h: HANDLE, code: u32) -> BOOL;
     fn SetPriorityClass(h: HANDLE, class: DWORD) -> BOOL;
+    fn CreateJobObjectW(attr: *const c_void, name: *const u16) -> HANDLE;
+    fn AssignProcessToJobObject(job: HANDLE, process: HANDLE) -> BOOL;
+    fn SetInformationJobObject(job: HANDLE, class: i32, info: *const c_void, len: u32) -> BOOL;
 }
 
 #[link(name = "ntdll")]
@@ -350,6 +363,55 @@ pub fn kill_all() -> usize {
     roblox_pids().into_iter().filter(|&pid| kill(pid)).count()
 }
 
+/// A Windows job object holding one client, used to cap how much CPU it may use. A process can't
+/// leave a job, so turning the limit off just disables the cap on the same job.
+pub struct CpuLimit(usize);
+
+impl CpuLimit {
+    pub fn attach(pid: u32) -> Option<CpuLimit> {
+        unsafe {
+            let job = CreateJobObjectW(null(), null());
+            if job.is_null() {
+                return None;
+            }
+            let limit = CpuLimit(job as usize);
+            let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if proc.is_null() {
+                return None;
+            }
+            let ok = AssignProcessToJobObject(job, proc) != 0;
+            CloseHandle(proc);
+            ok.then_some(limit)
+        }
+    }
+
+    /// Caps the client at `percent` of the PC's total CPU, or lifts the cap with `None`.
+    pub fn set(&self, percent: Option<u32>) -> bool {
+        let info = match percent {
+            Some(p) => JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+                flags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+                // In hundredths of a percent.
+                rate: p.clamp(1, 100) * 100,
+            },
+            None => JOBOBJECT_CPU_RATE_CONTROL_INFORMATION { flags: 0, rate: 0 },
+        };
+        unsafe {
+            SetInformationJobObject(
+                self.0 as HANDLE,
+                JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION_CLASS,
+                &info as *const _ as *const c_void,
+                size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            ) != 0
+        }
+    }
+}
+
+impl Drop for CpuLimit {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0 as HANDLE) };
+    }
+}
+
 /// Runs a client at below-normal priority so the main client gets the CPU first.
 pub fn set_low_priority(pid: u32, low: bool) -> bool {
     let class = if low { BELOW_NORMAL_PRIORITY_CLASS } else { NORMAL_PRIORITY_CLASS };
@@ -385,6 +447,54 @@ const GW_OWNER: u32 = 4;
 const WM_SETTEXT: u32 = 0x000C;
 const SMTO_ABORTIFHUNG: u32 = 0x2;
 const SW_MINIMIZE: i32 = 6;
+const SW_RESTORE: i32 = 9;
+const INPUT_MOUSE: u32 = 0;
+const INPUT_KEYBOARD: u32 = 1;
+const KEYEVENTF_KEYUP: u32 = 0x2;
+const KEYEVENTF_SCANCODE: u32 = 0x8;
+const MOUSEEVENTF_MOVE: u32 = 0x1;
+const SCAN_SPACE: u16 = 0x39;
+const ES_CONTINUOUS: u32 = 0x8000_0000;
+const ES_SYSTEM_REQUIRED: u32 = 0x1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MOUSEINPUT {
+    dx: i32,
+    dy: i32,
+    data: u32,
+    flags: u32,
+    time: u32,
+    extra: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KEYBDINPUT {
+    vk: u16,
+    scan: u16,
+    flags: u32,
+    time: u32,
+    extra: usize,
+}
+
+#[repr(C)]
+union InputData {
+    mi: MOUSEINPUT,
+    ki: KEYBDINPUT,
+}
+
+#[repr(C)]
+struct INPUT {
+    kind: u32,
+    data: InputData,
+}
+
+#[repr(C)]
+struct LASTINPUTINFO {
+    size: u32,
+    time: u32,
+}
 
 #[link(name = "user32")]
 extern "system" {
@@ -404,6 +514,20 @@ extern "system" {
         result: *mut usize,
     ) -> isize;
     fn ShowWindowAsync(hwnd: HANDLE, cmd: i32) -> BOOL;
+    fn IsIconic(hwnd: HANDLE) -> BOOL;
+    fn GetForegroundWindow() -> HANDLE;
+    fn SetForegroundWindow(hwnd: HANDLE) -> BOOL;
+    fn BringWindowToTop(hwnd: HANDLE) -> BOOL;
+    fn AttachThreadInput(attach: DWORD, to: DWORD, on: BOOL) -> BOOL;
+    fn SendInput(count: u32, inputs: *const INPUT, size: i32) -> u32;
+    fn GetLastInputInfo(info: *mut LASTINPUTINFO) -> BOOL;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentThreadId() -> DWORD;
+    fn GetTickCount() -> DWORD;
+    fn SetThreadExecutionState(flags: u32) -> u32;
 }
 
 pub fn message_box(title: &str, text: &str) {
@@ -449,10 +573,169 @@ pub fn set_client_title(pid: u32, title: &str) {
     }
 }
 
-pub fn minimize_client(pid: u32) {
-    for hwnd in windows_of(pid) {
+/// Returns how many windows were minimized; 0 when the client has no window yet.
+pub fn minimize_client(pid: u32) -> usize {
+    let windows = windows_of(pid);
+    for &hwnd in &windows {
         unsafe { ShowWindowAsync(hwnd, SW_MINIMIZE) };
     }
+    windows.len()
+}
+
+const HKEY_CURRENT_USER: usize = 0x8000_0001;
+const KEY_QUERY_VALUE: u32 = 0x1;
+const KEY_SET_VALUE: u32 = 0x2;
+const REG_SZ: u32 = 1;
+const ERROR_FILE_NOT_FOUND: i32 = 2;
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "MultiRoblox";
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegOpenKeyExW(key: HANDLE, sub: *const u16, options: u32, access: u32, out: *mut HANDLE) -> i32;
+    fn RegSetValueExW(key: HANDLE, name: *const u16, reserved: u32, kind: u32, data: *const u8, len: u32) -> i32;
+    fn RegQueryValueExW(
+        key: HANDLE,
+        name: *const u16,
+        reserved: *mut u32,
+        kind: *mut u32,
+        data: *mut u8,
+        len: *mut u32,
+    ) -> i32;
+    fn RegDeleteValueW(key: HANDLE, name: *const u16) -> i32;
+    fn RegCloseKey(key: HANDLE) -> i32;
+}
+
+/// The current user's "run at sign-in" registry key, the list Task Manager's Startup tab shows.
+fn run_key(access: u32) -> Option<HANDLE> {
+    let sub = wide(RUN_KEY);
+    let mut key: HANDLE = null_mut();
+    let r = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER as HANDLE, sub.as_ptr(), 0, access, &mut key) };
+    (r == 0).then_some(key)
+}
+
+pub fn starts_with_windows() -> bool {
+    let Some(key) = run_key(KEY_QUERY_VALUE) else { return false };
+    let name = wide(RUN_VALUE);
+    let mut len = 0u32;
+    let r = unsafe { RegQueryValueExW(key, name.as_ptr(), null_mut(), null_mut(), null_mut(), &mut len) };
+    unsafe { RegCloseKey(key) };
+    r == 0
+}
+
+/// Adds or removes Multi Roblox from the programs Windows starts at sign-in. It starts minimized.
+pub fn set_start_with_windows(on: bool) -> bool {
+    let Some(key) = run_key(KEY_SET_VALUE) else { return false };
+    let name = wide(RUN_VALUE);
+    let ok = if on {
+        let Ok(exe) = std::env::current_exe() else {
+            unsafe { RegCloseKey(key) };
+            return false;
+        };
+        let cmd = wide(&format!("\"{}\" --startup", exe.display()));
+        let bytes = (cmd.len() * 2) as u32;
+        unsafe { RegSetValueExW(key, name.as_ptr(), 0, REG_SZ, cmd.as_ptr() as *const u8, bytes) == 0 }
+    } else {
+        let r = unsafe { RegDeleteValueW(key, name.as_ptr()) };
+        r == 0 || r == ERROR_FILE_NOT_FOUND
+    };
+    unsafe { RegCloseKey(key) };
+    ok
+}
+
+/// Seconds since the user last touched the keyboard or mouse.
+pub fn user_idle_secs() -> u32 {
+    let mut info = LASTINPUTINFO { size: size_of::<LASTINPUTINFO>() as u32, time: 0 };
+    unsafe {
+        if GetLastInputInfo(&mut info) == 0 {
+            return 0;
+        }
+        GetTickCount().wrapping_sub(info.time) / 1000
+    }
+}
+
+/// Stops Windows from sleeping while `on`. Must be called from a thread that lives as long as the app.
+pub fn keep_awake(on: bool) {
+    let flags = if on { ES_CONTINUOUS | ES_SYSTEM_REQUIRED } else { ES_CONTINUOUS };
+    unsafe { SetThreadExecutionState(flags) };
+}
+
+/// Brings a window to the front. Windows only lets the foreground app hand over focus, so we
+/// briefly share input state with it.
+fn focus(hwnd: HANDLE) -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg == hwnd {
+            return true;
+        }
+        let fg_thread = GetWindowThreadProcessId(fg, null_mut());
+        let me = GetCurrentThreadId();
+        let attached = fg_thread != 0 && fg_thread != me && AttachThreadInput(me, fg_thread, 1) != 0;
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+        if attached {
+            AttachThreadInput(me, fg_thread, 0);
+        }
+        GetForegroundWindow() == hwnd
+    }
+}
+
+fn key(scan: u16, up: bool) -> INPUT {
+    let flags = KEYEVENTF_SCANCODE | if up { KEYEVENTF_KEYUP } else { 0 };
+    INPUT { kind: INPUT_KEYBOARD, data: InputData { ki: KEYBDINPUT { vk: 0, scan, flags, time: 0, extra: 0 } } }
+}
+
+fn mouse_move(dx: i32, dy: i32) -> INPUT {
+    let mi = MOUSEINPUT { dx, dy, data: 0, flags: MOUSEEVENTF_MOVE, time: 0, extra: 0 };
+    INPUT { kind: INPUT_MOUSE, data: InputData { mi } }
+}
+
+fn send(input: INPUT) {
+    unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+}
+
+fn pause(ms: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
+/// Gives each client's window a moment of input so Roblox doesn't count the player as idle, then
+/// puts back the window that was in front. Input is only sent while a Roblox window really has
+/// focus, so it can never land in another program. Returns how many windows were nudged.
+pub fn nudge_clients(pids: &[u32], jump: bool) -> usize {
+    let previous = unsafe { GetForegroundWindow() };
+    let mut nudged = 0;
+    for &pid in pids {
+        for hwnd in windows_of(pid) {
+            let minimized = unsafe { IsIconic(hwnd) } != 0;
+            if minimized {
+                unsafe { ShowWindowAsync(hwnd, SW_RESTORE) };
+                pause(300);
+            }
+            if focus(hwnd) {
+                pause(150);
+                if unsafe { GetForegroundWindow() } == hwnd {
+                    if jump {
+                        send(key(SCAN_SPACE, false));
+                        pause(60);
+                        send(key(SCAN_SPACE, true));
+                    } else {
+                        send(mouse_move(12, 0));
+                        pause(40);
+                        send(mouse_move(-12, 0));
+                    }
+                    pause(100);
+                    nudged += 1;
+                }
+            }
+            if minimized {
+                unsafe { ShowWindowAsync(hwnd, SW_MINIMIZE) };
+            }
+        }
+    }
+    if !previous.is_null() {
+        focus(previous);
+    }
+    nudged
 }
 
 #[repr(C)]

@@ -4,6 +4,10 @@
 //! one-time authentication ticket, then hand that ticket to the `roblox-player:` protocol.
 
 use crate::multi;
+use crate::store::ServerPick;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -45,6 +49,7 @@ pub struct Presence {
     pub kind: u8,
     pub location: String,
     pub place_id: Option<u64>,
+    pub root_place_id: Option<u64>,
     pub game_id: Option<String>,
 }
 
@@ -162,23 +167,49 @@ pub fn authenticated_user(cookie: &str) -> Res<UserInfo> {
     }
 }
 
-pub fn presence(cookie: &str, user_id: u64) -> Res<Presence> {
-    let body = format!("{{\"userIds\":[{user_id}]}}");
-    let r = csrf_post(cookie, "https://presence.roblox.com/v1/presence/users", Some(&body))?;
+fn json_of(r: ureq::Response) -> Res<Value> {
     match r.status() {
-        200 => {
-            let v: serde_json::Value = serde_json::from_str(&r.into_string().map_err(other)?).map_err(other)?;
-            let p = &v["userPresences"][0];
-            Ok(Presence {
+        200 => serde_json::from_str(&r.into_string().map_err(other)?).map_err(other),
+        401 => Err(ApiError::Expired),
+        429 => Err(other("Roblox is rate limiting requests - try again in a moment")),
+        s => Err(other(format!("Roblox returned HTTP {s}"))),
+    }
+}
+
+fn get_json(cookie: &str, url: &str) -> Res<Value> {
+    json_of(finish(agent().get(url).set("Cookie", &cookie_header(cookie)).call())?)
+}
+
+fn post_json(cookie: &str, url: &str, body: &Value) -> Res<Value> {
+    json_of(csrf_post(cookie, url, Some(&body.to_string()))?)
+}
+
+/// Presence of several users, looked up as the account that owns `cookie`.
+pub fn presence_many(cookie: &str, ids: &[u64]) -> Res<Vec<(u64, Presence)>> {
+    let mut out = Vec::new();
+    for chunk in ids.chunks(50) {
+        let body = serde_json::json!({ "userIds": chunk });
+        let v = post_json(cookie, "https://presence.roblox.com/v1/presence/users", &body)?;
+        for p in v["userPresences"].as_array().into_iter().flatten() {
+            let presence = Presence {
                 kind: p["userPresenceType"].as_u64().unwrap_or(0) as u8,
                 location: p["lastLocation"].as_str().unwrap_or_default().to_string(),
                 place_id: p["placeId"].as_u64(),
+                root_place_id: p["rootPlaceId"].as_u64(),
                 game_id: p["gameId"].as_str().map(str::to_string),
-            })
+            };
+            out.push((p["userId"].as_u64().unwrap_or(0), presence));
         }
-        401 => Err(ApiError::Expired),
-        s => Err(other(format!("presence lookup failed (HTTP {s})"))),
     }
+    Ok(out)
+}
+
+pub fn presence(cookie: &str, user_id: u64) -> Res<Presence> {
+    presence_many(cookie, &[user_id])?
+        .into_iter()
+        .next()
+        .map(|(_, p)| p)
+        .ok_or_else(|| other("presence lookup returned nothing"))
 }
 
 fn auth_ticket(cookie: &str) -> Res<String> {
@@ -315,6 +346,333 @@ fn query_param(url: &str, key: &str) -> Option<String> {
         let (k, v) = pair.split_once('=')?;
         (k == key && !v.is_empty()).then(|| v.to_string())
     })
+}
+
+/// A game as shown on a Home card.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Game {
+    pub universe: u64,
+    pub place: u64,
+    pub name: String,
+    pub playing: Option<u64>,
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub stats: Option<Stats>,
+}
+
+/// What the hover card shows about a game.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct Stats {
+    pub creator: String,
+    pub genre: String,
+    pub visits: u64,
+    pub max_players: u64,
+    pub favorites: u64,
+    pub up_votes: u64,
+    pub down_votes: u64,
+    /// "YYYY-MM-DD"
+    pub updated: String,
+}
+
+/// A friend who is in a game right now.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FriendGame {
+    pub user_id: u64,
+    pub name: String,
+    pub display: String,
+    pub avatar: Option<String>,
+    /// Empty when the friend's privacy settings hide where they are.
+    pub game: String,
+    pub place: Option<u64>,
+    pub job: Option<String>,
+}
+
+/// Reads a game from the metadata objects the discovery and search endpoints return.
+fn game_from(v: &Value) -> Option<Game> {
+    Some(Game {
+        universe: v["universeId"].as_u64()?,
+        place: v["rootPlaceId"].as_u64()?,
+        name: v["name"].as_str()?.to_string(),
+        playing: v["playerCount"].as_u64(),
+        icon: None,
+        stats: None,
+    })
+}
+
+fn random_u64() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+    let mut x = nanos ^ COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+    for _ in 0..3 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+    }
+    x
+}
+
+/// A random UUID-shaped id; the discovery endpoints want one per browsing session.
+fn session_id() -> String {
+    let (a, b) = (random_u64(), random_u64());
+    format!(
+        "{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}",
+        a >> 32,
+        (a >> 16) & 0xffff,
+        a & 0xfff,
+        b >> 52,
+        b & 0xffff_ffff_ffff
+    )
+}
+
+pub fn universe_of(cookie: &str, place: u64) -> Res<u64> {
+    let v = get_json(cookie, &format!("https://apis.roblox.com/universes/v1/places/{place}/universe"))?;
+    v["universeId"].as_u64().ok_or_else(|| other("unknown place"))
+}
+
+fn details_map(cookie: &str, universes: &[u64]) -> Res<HashMap<u64, Game>> {
+    let mut found = HashMap::new();
+    for chunk in universes.chunks(50) {
+        let ids: Vec<String> = chunk.iter().map(u64::to_string).collect();
+        let v = get_json(cookie, &format!("https://games.roblox.com/v1/games?universeIds={}", ids.join(",")))?;
+        for g in v["data"].as_array().into_iter().flatten() {
+            let (Some(universe), Some(place)) = (g["id"].as_u64(), g["rootPlaceId"].as_u64()) else { continue };
+            let text = |k: &str| g[k].as_str().unwrap_or_default().to_string();
+            let genre = [text("genre_l1"), text("genre")].into_iter().find(|s| !s.is_empty() && s != "All");
+            let stats = Stats {
+                creator: g["creator"]["name"].as_str().unwrap_or_default().to_string(),
+                genre: genre.unwrap_or_default(),
+                visits: g["visits"].as_u64().unwrap_or(0),
+                max_players: g["maxPlayers"].as_u64().unwrap_or(0),
+                favorites: g["favoritedCount"].as_u64().unwrap_or(0),
+                updated: text("updated").chars().take(10).collect(),
+                ..Stats::default()
+            };
+            let game = Game {
+                universe,
+                place,
+                name: text("name"),
+                playing: g["playing"].as_u64(),
+                icon: None,
+                stats: Some(stats),
+            };
+            found.insert(universe, game);
+        }
+    }
+    Ok(found)
+}
+
+/// Names, live player counts and stats for games, in the order the universes were given.
+pub fn game_details(cookie: &str, universes: &[u64]) -> Res<Vec<Game>> {
+    let mut found = details_map(cookie, universes)?;
+    Ok(universes.iter().filter_map(|u| found.remove(u)).collect())
+}
+
+/// Fills in whatever games are missing for their cards: stats, likes and icons. Lookups that fail
+/// just leave the gaps.
+pub fn enrich(cookie: &str, games: &mut [Game]) {
+    let missing: Vec<u64> = games.iter().filter(|g| g.stats.is_none()).map(|g| g.universe).collect();
+    if let Ok(found) = details_map(cookie, &missing) {
+        for g in games.iter_mut() {
+            if let Some(d) = found.get(&g.universe) {
+                g.stats = d.stats.clone();
+                g.playing = d.playing.or(g.playing);
+            }
+        }
+    }
+    let universes: Vec<u64> = games.iter().map(|g| g.universe).collect();
+    for chunk in universes.chunks(50) {
+        let ids: Vec<String> = chunk.iter().map(u64::to_string).collect();
+        let Ok(v) = get_json(cookie, &format!("https://games.roblox.com/v1/games/votes?universeIds={}", ids.join(",")))
+        else {
+            continue;
+        };
+        for vote in v["data"].as_array().into_iter().flatten() {
+            let Some(id) = vote["id"].as_u64() else { continue };
+            for s in games.iter_mut().filter(|g| g.universe == id).filter_map(|g| g.stats.as_mut()) {
+                s.up_votes = vote["upVotes"].as_u64().unwrap_or(0);
+                s.down_votes = vote["downVotes"].as_u64().unwrap_or(0);
+            }
+        }
+    }
+    add_icons(cookie, games);
+}
+
+/// Avatar headshot URLs for users.
+pub fn headshots(cookie: &str, ids: &[u64]) -> HashMap<u64, String> {
+    let mut out = HashMap::new();
+    for chunk in ids.chunks(100) {
+        let list: Vec<String> = chunk.iter().map(u64::to_string).collect();
+        let url = format!(
+            "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={}&size=150x150&format=Png&isCircular=false",
+            list.join(",")
+        );
+        let Ok(v) = get_json(cookie, &url) else { continue };
+        for t in v["data"].as_array().into_iter().flatten() {
+            if let (Some(id), Some(url)) = (t["targetId"].as_u64(), t["imageUrl"].as_str()) {
+                out.insert(id, url.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Fills in game icons. Missing icons just stay empty.
+fn add_icons(cookie: &str, games: &mut [Game]) {
+    let universes: Vec<u64> = games.iter().filter(|g| g.icon.is_none()).map(|g| g.universe).collect();
+    for chunk in universes.chunks(50) {
+        let ids: Vec<String> = chunk.iter().map(u64::to_string).collect();
+        let url = format!(
+            "https://thumbnails.roblox.com/v1/games/icons?universeIds={}&returnPolicy=PlaceHolder&size=150x150&format=Png&isCircular=false",
+            ids.join(",")
+        );
+        let Ok(v) = get_json(cookie, &url) else { continue };
+        for t in v["data"].as_array().into_iter().flatten() {
+            if let (Some(id), Some(url)) = (t["targetId"].as_u64(), t["imageUrl"].as_str()) {
+                for g in games.iter_mut().filter(|g| g.universe == id) {
+                    g.icon = Some(url.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Roblox's own "Continue" row for the account (an unofficial endpoint).
+pub fn continue_list(cookie: &str) -> Res<Vec<Game>> {
+    let body = serde_json::json!({ "pageType": "Home", "sessionId": session_id() });
+    let v = post_json(cookie, "https://apis.roblox.com/discovery-api/omni-recommendation", &body)?;
+    let meta = &v["contentMetadata"]["Game"];
+    let sort = v["sorts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["topic"].as_str().is_some_and(|t| t.to_lowercase().contains("continue")));
+    let Some(sort) = sort else { return Ok(Vec::new()) };
+    Ok(sort["recommendationList"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["contentType"].as_str() == Some("Game"))
+        .filter_map(|r| game_from(&meta[r["contentId"].as_u64()?.to_string()]))
+        .collect())
+}
+
+/// Games the user favorited on Roblox, newest first.
+pub fn favorites(cookie: &str, user_id: u64) -> Res<Vec<Game>> {
+    let v = get_json(
+        cookie,
+        &format!("https://games.roblox.com/v2/users/{user_id}/favorite/games?limit=50&sortOrder=Desc"),
+    )?;
+    let universes: Vec<u64> = v["data"].as_array().into_iter().flatten().filter_map(|g| g["id"].as_u64()).collect();
+    game_details(cookie, &universes)
+}
+
+/// The Charts page: (row title, games) for each of its rows (an unofficial endpoint).
+pub fn charts(cookie: &str) -> Res<Vec<(String, Vec<Game>)>> {
+    let url = format!(
+        "https://apis.roblox.com/explore-api/v1/get-sorts?sessionId={}&device=computer&country=all",
+        session_id()
+    );
+    let v = get_json(cookie, &url)?;
+    Ok(v["sorts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let title = [&s["sortDisplayName"], &s["sortId"]]
+                .iter()
+                .find_map(|t| t.as_str().filter(|t| !t.is_empty()))?
+                .to_string();
+            let games: Vec<Game> = s["games"].as_array()?.iter().filter_map(game_from).collect();
+            (!games.is_empty()).then_some((title, games))
+        })
+        .take(5)
+        .collect())
+}
+
+/// Searches all of Roblox for games (an unofficial endpoint).
+pub fn search(cookie: &str, query: &str) -> Res<Vec<Game>> {
+    let url = format!(
+        "https://apis.roblox.com/search-api/omni-search?searchQuery={}&sessionId={}&pageType=all",
+        url_encode(query),
+        session_id()
+    );
+    let v = get_json(cookie, &url)?;
+    Ok(v["searchResults"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|g| g["contentGroupType"].as_str() == Some("Game"))
+        .flat_map(|g| g["contents"].as_array().into_iter().flatten())
+        .filter_map(game_from)
+        .collect())
+}
+
+/// Friends of the user who are in a game right now, with names and avatars.
+pub fn friends_playing(cookie: &str, user_id: u64) -> Res<Vec<FriendGame>> {
+    let v = get_json(cookie, &format!("https://friends.roblox.com/v1/users/{user_id}/friends"))?;
+    let ids: Vec<u64> = v["data"].as_array().into_iter().flatten().filter_map(|f| f["id"].as_u64()).collect();
+    let playing: Vec<(u64, Presence)> = presence_many(cookie, &ids)?.into_iter().filter(|(_, p)| p.kind == 2).collect();
+    if playing.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<u64> = playing.iter().map(|(id, _)| *id).collect();
+
+    let mut names = HashMap::new();
+    let body = serde_json::json!({ "userIds": ids, "excludeBannedUsers": false });
+    if let Ok(v) = post_json(cookie, "https://users.roblox.com/v1/users", &body) {
+        for u in v["data"].as_array().into_iter().flatten() {
+            if let Some(id) = u["id"].as_u64() {
+                let name = u["name"].as_str().unwrap_or_default().to_string();
+                names.insert(id, (name, u["displayName"].as_str().unwrap_or_default().to_string()));
+            }
+        }
+    }
+    let mut avatars = headshots(cookie, &ids);
+
+    Ok(playing
+        .into_iter()
+        .map(|(id, p)| {
+            let (name, display) = names.remove(&id).unwrap_or_default();
+            FriendGame {
+                user_id: id,
+                name,
+                display,
+                avatar: avatars.remove(&id),
+                game: p.location,
+                place: p.root_place_id.or(p.place_id),
+                job: p.game_id,
+            }
+        })
+        .collect())
+}
+
+/// Lower is better. Ping counts as-is; a server outside the 50-85% full sweet spot pays up to
+/// 200 ms extra, so a busy server with good ping beats an empty one with slightly better ping.
+fn server_score(s: &Server) -> f64 {
+    let fill = s.playing as f64 / s.max.max(1) as f64;
+    let off = if fill < 0.5 {
+        0.5 - fill
+    } else if fill > 0.85 {
+        fill - 0.85
+    } else {
+        0.0
+    };
+    s.ping.unwrap_or(250) as f64 + off * 400.0
+}
+
+/// Picks a public server with room for `need` more players, following `pick`.
+pub fn pick_server(cookie: &str, place: u64, pick: ServerPick, need: u32) -> Res<Option<Server>> {
+    if pick == ServerPick::Any {
+        return Ok(None);
+    }
+    let fits = |s: &Server| s.max.saturating_sub(s.playing) >= need;
+    let mut list: Vec<Server> = servers(cookie, place, pick == ServerPick::Fewest)?.into_iter().filter(fits).collect();
+    match pick {
+        ServerPick::LowestPing => list.sort_by_key(|s| s.ping.unwrap_or(u32::MAX)),
+        ServerPick::Best => list.sort_by(|a, b| server_score(a).total_cmp(&server_score(b))),
+        _ => {}
+    }
+    Ok(list.into_iter().next())
 }
 
 /// Reads a place id from plain digits or a roblox.com/games/<id>/... link.
