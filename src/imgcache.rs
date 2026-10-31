@@ -1,6 +1,10 @@
 //! Keeps game icons and avatars on disk so Home shows them instantly on the next start. An image
 //! is shown from the web the first time, while a background thread saves a copy.
+//!
+//! Saved copies are handed to egui as bytes: its file loader turns `file://C:/...` into a network
+//! path on Windows and fails.
 
+use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Sender};
@@ -8,6 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 pub struct ImageCache {
+    ctx: egui::Context,
     dir: PathBuf,
     /// Web URL -> the URI to show it from (a local file once saved).
     resolved: HashMap<String, String>,
@@ -40,7 +45,7 @@ fn download(url: &str, path: &PathBuf) {
 }
 
 impl ImageCache {
-    pub fn new() -> ImageCache {
+    pub fn new(ctx: egui::Context) -> ImageCache {
         let dir = dir();
         let _ = std::fs::create_dir_all(&dir);
         let (tx, rx) = channel::<(String, PathBuf)>();
@@ -49,7 +54,7 @@ impl ImageCache {
                 download(&url, &path);
             }
         });
-        ImageCache { dir, resolved: HashMap::new(), queued: HashSet::new(), downloads: tx }
+        ImageCache { ctx, dir, resolved: HashMap::new(), queued: HashSet::new(), downloads: tx }
     }
 
     /// The URI to show `url` from: the saved copy when there is one, otherwise the web URL (and a
@@ -58,9 +63,12 @@ impl ImageCache {
         if let Some(u) = self.resolved.get(url) {
             return u.clone();
         }
-        let path = self.dir.join(format!("{:016x}.png", hash(url)));
-        let uri = if path.exists() {
-            format!("file://{}", path.display().to_string().replace('\\', "/"))
+        let name = format!("{:016x}.png", hash(url));
+        let path = self.dir.join(&name);
+        let uri = if let Ok(bytes) = std::fs::read(&path) {
+            let uri = format!("bytes://{name}");
+            self.ctx.include_bytes(uri.clone(), bytes);
+            uri
         } else {
             if self.queued.insert(url.to_string()) {
                 let _ = self.downloads.send((url.to_string(), path));

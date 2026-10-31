@@ -71,7 +71,7 @@ fn apply<T: Clone>(row: &mut Row<T>, result: Result<T, String>, saved: &mut T, t
 }
 
 impl HomeState {
-    pub fn new() -> HomeState {
+    pub fn new(ctx: egui::Context) -> HomeState {
         let cache = std::fs::read_to_string(cache_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -87,7 +87,7 @@ impl HomeState {
             search: None,
             searching: false,
             cache,
-            images: ImageCache::new(),
+            images: ImageCache::new(ctx),
         }
     }
 

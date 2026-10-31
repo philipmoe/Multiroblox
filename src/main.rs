@@ -89,6 +89,7 @@ impl App {
             multi::set_start_with_windows(true);
         }
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        add_windows_fonts(&cc.egui_ctx);
         if std::env::args().any(|a| a == "--startup") {
             // Started by Windows at sign-in: stay out of the way until opened from the taskbar.
             cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -103,7 +104,7 @@ impl App {
         let mut app = App {
             tab,
             history: History::load(),
-            home: HomeState::new(),
+            home: HomeState::new(cc.egui_ctx.clone()),
             avatars: HashMap::new(),
             start_with_windows,
             cfg,
@@ -907,6 +908,22 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         store::save(&self.cfg);
     }
+}
+
+/// Adds Windows' symbol and emoji fonts as fallbacks, so game names with emoji or symbols don't
+/// show empty boxes.
+fn add_windows_fonts(ctx: &egui::Context) {
+    let Some(windir) = std::env::var_os("WINDIR") else { return };
+    let dir = std::path::PathBuf::from(windir).join("Fonts");
+    let mut fonts = egui::FontDefinitions::default();
+    for (name, file) in [("segoe_symbol", "seguisym.ttf"), ("segoe_emoji", "seguiemj.ttf")] {
+        let Ok(bytes) = std::fs::read(dir.join(file)) else { continue };
+        fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(name.into());
+        }
+    }
+    ctx.set_fonts(fonts);
 }
 
 fn main() -> eframe::Result {
