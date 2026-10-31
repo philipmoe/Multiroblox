@@ -22,7 +22,7 @@ use home::HomeState;
 use jobs::{Acct, Bg, HomePart, Msg, Watch};
 use live::LiveState;
 use roblox::{Presence, Server, Target};
-use servers::ServersTab;
+use servers::{PrivateList, ServersTab};
 use store::ServerPick;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,6 +74,7 @@ struct App {
     servers_failed: bool,
     fewest_first: bool,
     servers_tab: ServersTab,
+    private: PrivateList,
     /// Name typed for "save the current game".
     save_name: String,
     awake_applied: bool,
@@ -141,6 +142,7 @@ impl App {
             servers_failed: false,
             fewest_first: false,
             servers_tab: ServersTab::default(),
+            private: PrivateList::default(),
             save_name: String::new(),
             awake_applied: false,
             live: LiveState::new(),
@@ -382,6 +384,11 @@ impl App {
                 Msg::Joined { live, fresh } => self.on_joined(live, fresh),
                 Msg::JoinInfo { live, fresh, game, location } => self.on_join_info(live, fresh, game, location),
                 Msg::FriendsPlaying(list) => self.on_friends_playing(list),
+                Msg::PrivateServers(list) => {
+                    self.private.loading = false;
+                    self.private.failed = list.is_none();
+                    self.private.servers = list.unwrap_or_default();
+                }
             }
         }
     }

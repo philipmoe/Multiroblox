@@ -331,7 +331,7 @@ fn game_row(
 
 impl App {
     /// The account Home browses and plays as: the one picked on Home, else main, else the first.
-    fn home_account_id(&self) -> Option<u64> {
+    pub(crate) fn home_account_id(&self) -> Option<u64> {
         let exists = |id: &u64| self.cfg.accounts.iter().any(|a| a.user_id == *id);
         self.cfg
             .home_account

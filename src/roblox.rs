@@ -71,6 +71,8 @@ pub enum Target {
     Place { place: u64, job: Option<String> },
     /// A private server, from the `privateServerLinkCode` of its link.
     Private { place: u64, link_code: String },
+    /// A private server the account owns or was invited to, by its access code.
+    PrivateAccess { place: u64, access_code: String },
     /// A roblox.com/share link; it is turned into `Private` with `resolve_share_link` before launching.
     ShareLink { code: String },
     Follow { user_id: u64 },
@@ -331,6 +333,10 @@ pub fn launch(cookie: &str, target: &Target) -> Res<()> {
         Target::Private { place, link_code } => format!(
             "https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestPrivateGame&browserTrackerId={tracker}&placeId={place}&linkCode={}&isPlayTogetherGame=false",
             url_encode(link_code)
+        ),
+        Target::PrivateAccess { place, access_code } => format!(
+            "https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestPrivateGame&browserTrackerId={tracker}&placeId={place}&accessCode={}&isPlayTogetherGame=false",
+            url_encode(access_code)
         ),
         Target::ShareLink { .. } => return Err(other("the share link has to be resolved before launching")),
         Target::Follow { user_id } => format!(
@@ -695,6 +701,57 @@ fn server_score(s: &Server) -> f64 {
         0.0
     };
     s.ping.unwrap_or(250) as f64 + off * 400.0
+}
+
+/// A private server the account can join.
+#[derive(Clone)]
+pub struct PrivateServer {
+    pub name: String,
+    pub owner: String,
+    /// True when the account itself owns it.
+    pub mine: bool,
+    pub access_code: String,
+    pub playing: u32,
+    pub max: u32,
+}
+
+/// The private servers of a game that the account owns or was given access to.
+pub fn private_servers(cookie: &str, user_id: u64, place: u64) -> Res<Vec<PrivateServer>> {
+    let mut out = Vec::new();
+    let mut cursor = String::new();
+    // A few pages at most; accounts rarely have more than a handful per game.
+    for _ in 0..5 {
+        let url = format!(
+            "https://games.roblox.com/v1/games/{place}/private-servers?limit=100&sortOrder=Asc{}",
+            if cursor.is_empty() { String::new() } else { format!("&cursor={}", url_encode(&cursor)) }
+        );
+        let v = get_json(cookie, &url)?;
+        for s in v["data"].as_array().into_iter().flatten() {
+            let Some(code) = s["accessCode"].as_str() else { continue };
+            let owner = &s["owner"];
+            let owner_name = [&owner["displayName"], &owner["name"]]
+                .iter()
+                .find_map(|n| n.as_str().filter(|n| !n.is_empty()))
+                .unwrap_or("someone")
+                .to_string();
+            let players = s["players"].as_array().map_or(0, Vec::len).max(s["playerTokens"].as_array().map_or(0, Vec::len));
+            out.push(PrivateServer {
+                name: s["name"].as_str().filter(|n| !n.is_empty()).unwrap_or("Private server").to_string(),
+                owner: owner_name,
+                mine: owner["id"].as_u64() == Some(user_id),
+                access_code: code.to_string(),
+                playing: players as u32,
+                max: s["maxPlayers"].as_u64().unwrap_or(0) as u32,
+            });
+        }
+        match v["nextPageCursor"].as_str() {
+            Some(c) if !c.is_empty() => cursor = c.to_string(),
+            _ => break,
+        }
+    }
+    // Your own servers first, then the busiest.
+    out.sort_by(|a, b| b.mine.cmp(&a.mine).then(b.playing.cmp(&a.playing)));
+    Ok(out)
 }
 
 /// Picks a public server with room for `need` more players, following `pick`.

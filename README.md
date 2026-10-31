@@ -32,6 +32,8 @@ started from here:
 
 - **Server location**: the header and account list show where each client's server is
   (e.g. "London, GB"), and a Windows notification says which game and server a client joined.
+- **Private servers**: the Servers window lists the private servers of the selected game that the
+  "Playing as" account owns or was invited to, with a **Join** button.
 - **Recent servers**: the Servers window lists the last 30 servers any client was in, with a
   **Rejoin** button for that exact server.
 - **Saved games and private servers**: save a game, server or private server link under a name and

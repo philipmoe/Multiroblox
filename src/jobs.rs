@@ -3,7 +3,7 @@
 
 use crate::gamesettings::{self, Profile};
 use crate::logwatch::Live;
-use crate::roblox::{self, ApiError, FriendGame, Game, Presence, Server, Target};
+use crate::roblox::{self, ApiError, FriendGame, Game, Presence, PrivateServer, Server, Target};
 use crate::store::{self, Account, ServerPick};
 use crate::{audio, multi};
 use eframe::egui;
@@ -53,6 +53,8 @@ pub enum Msg {
     JoinInfo { live: Live, fresh: bool, game: Option<Game>, location: Option<String> },
     /// Friends of saved accounts who just started playing: (name, game).
     FriendsPlaying(Vec<(String, String)>),
+    /// Private servers of a game for an account; `None` when the lookup failed.
+    PrivateServers(Option<Vec<PrivateServer>>),
 }
 
 /// One row of the Home page, or why it couldn't load.
@@ -226,6 +228,19 @@ pub fn servers(bg: &Bg, a: Acct, place: u64, fewest_first: bool) {
     });
 }
 
+pub fn private_servers(bg: &Bg, a: Acct, place: u64) {
+    bg.spawn(move |bg| {
+        let list = match roblox::private_servers(&a.cookie, a.id, place) {
+            Ok(list) => Some(list),
+            Err(e) => {
+                bg.log(format!("Private servers: {e}"));
+                None
+            }
+        };
+        bg.send(Msg::PrivateServers(list));
+    });
+}
+
 /// Turns a share link into the private server it points to; other targets pass through.
 fn resolve(bg: &Bg, a: &Acct, target: Target) -> Option<Target> {
     let Target::ShareLink { code } = &target else {
@@ -314,7 +329,9 @@ fn launch_one(bg: &Bg, a: &Acct, target: &Target) -> bool {
     match roblox::launch(&a.cookie, target) {
         Ok(()) => {
             bg.log(format!("Launching {}...", a.name));
-            if let Target::Place { place, .. } | Target::Private { place, .. } = target {
+            if let Target::Place { place, .. } | Target::Private { place, .. } | Target::PrivateAccess { place, .. } =
+                target
+            {
                 bg.send(Msg::Launched(*place));
             }
             match new_client(bg, &before) {

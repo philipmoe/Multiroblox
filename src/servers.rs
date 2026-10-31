@@ -3,7 +3,7 @@
 
 use crate::history;
 use crate::jobs;
-use crate::roblox::Target;
+use crate::roblox::{self, PrivateServer, Target};
 use crate::store::SavedLink;
 use crate::{App, BLUE, RED};
 use eframe::egui::{self, RichText};
@@ -12,12 +12,24 @@ use eframe::egui::{self, RichText};
 pub enum ServersTab {
     #[default]
     Browse,
+    Private,
     Recent,
     Saved,
 }
 
+/// Private servers of one game for one account, as last loaded.
+#[derive(Default)]
+pub struct PrivateList {
+    /// (place, account) the list is for.
+    pub for_: Option<(u64, u64)>,
+    pub servers: Vec<PrivateServer>,
+    pub loading: bool,
+    pub failed: bool,
+}
+
 enum Pick {
     Job(String),
+    JoinPrivate(usize),
     Rejoin(usize),
     UseSaved(usize),
     JoinSaved(usize),
@@ -74,6 +86,86 @@ impl App {
                 });
             });
         }
+    }
+
+    /// The public game in the Game panel, if that's what it holds.
+    fn selected_place(&self) -> Option<u64> {
+        match roblox::parse_target(&self.cfg.place_id, "") {
+            Some(Target::Place { place, .. }) => Some(place),
+            _ => None,
+        }
+    }
+
+    fn load_private(&mut self, place: u64) {
+        let Some(id) = self.home_account_id() else { return };
+        let Some(a) = self.acct(id) else { return };
+        self.private = PrivateList { for_: Some((place, id)), loading: true, ..PrivateList::default() };
+        jobs::private_servers(&self.bg, a, place);
+    }
+
+    fn private_tab(&mut self, ui: &mut egui::Ui, pick: &mut Option<Pick>) {
+        let Some(place) = self.selected_place() else {
+            ui.label(RichText::new("Pick a game first: click one on Home, or enter its place ID in the Game panel.").weak());
+            return;
+        };
+        let Some(account) = self.home_account_id() else {
+            ui.label(RichText::new("Add an account first.").weak());
+            return;
+        };
+        // Load when the game or the "Playing as" account changed.
+        if self.private.for_ != Some((place, account)) {
+            self.load_private(place);
+        }
+        let name = self.account_name(Some(account));
+        let game = self.live.game_name(place).map(str::to_string).or_else(|| {
+            self.history.get(place).map(|h| h.name.clone()).filter(|n| !n.is_empty())
+        });
+        ui.horizontal(|ui| {
+            let what = game.map_or("this game".to_string(), |g| g);
+            ui.label(RichText::new(format!("Private servers for {what} that {name} can join")).weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Reload").clicked() {
+                    self.private.for_ = None;
+                }
+            });
+        });
+        ui.label(RichText::new("Change the account with \"Playing as\" on Home.").weak().small());
+        ui.add_space(4.0);
+        if self.private.loading {
+            ui.colored_label(BLUE, "Loading...");
+            return;
+        }
+        if self.private.failed {
+            ui.colored_label(RED, "Could not load private servers - see the log.");
+            return;
+        }
+        if self.private.servers.is_empty() {
+            ui.label(RichText::new("No private servers for this game on this account.").weak());
+            return;
+        }
+        let rows: Vec<(String, String)> = self
+            .private
+            .servers
+            .iter()
+            .map(|s| {
+                let who = if s.mine { "Yours".to_string() } else { format!("Owner: {}", s.owner) };
+                let players = if s.playing > 0 {
+                    format!("{}/{} playing", s.playing, s.max)
+                } else {
+                    format!("empty, up to {}", s.max)
+                };
+                (s.name.clone(), format!("{who} · {players}"))
+            })
+            .collect();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for (i, (title, detail)) in rows.iter().enumerate() {
+                row(ui, title, detail, |ui| {
+                    if ui.button("Join").clicked() {
+                        *pick = Some(Pick::JoinPrivate(i));
+                    }
+                });
+            }
+        });
     }
 
     fn recent_tab(&mut self, ui: &mut egui::Ui, pick: &mut Option<Pick>) {
@@ -154,6 +246,7 @@ impl App {
                 ui.horizontal(|ui| {
                     for (t, label) in [
                         (ServersTab::Browse, "Browse"),
+                        (ServersTab::Private, "Private"),
                         (ServersTab::Recent, "Recent"),
                         (ServersTab::Saved, "Saved"),
                     ] {
@@ -163,6 +256,7 @@ impl App {
                 ui.separator();
                 match self.servers_tab {
                     ServersTab::Browse => self.browse_tab(ui, &mut pick, &mut reload),
+                    ServersTab::Private => self.private_tab(ui, &mut pick),
                     ServersTab::Recent => self.recent_tab(ui, &mut pick),
                     ServersTab::Saved => self.saved_tab(ui, &mut pick),
                 }
@@ -191,6 +285,15 @@ impl App {
                 self.dirty = true;
                 self.show_servers = false;
                 self.say("Server picked - launches now go to that server.");
+            }
+            Pick::JoinPrivate(i) => {
+                let (Some(s), Some((place, _))) = (self.private.servers.get(i).cloned(), self.private.for_) else {
+                    return;
+                };
+                let Some(a) = self.home_account() else { return };
+                self.say(format!("Joining private server {} as {}...", s.name, a.name));
+                let target = Target::PrivateAccess { place, access_code: s.access_code };
+                jobs::launch_many(&self.bg, vec![a], target, 0);
             }
             Pick::Rejoin(i) => {
                 let Some(v) = self.history.servers.get(i).cloned() else { return };
