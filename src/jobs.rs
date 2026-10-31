@@ -2,6 +2,7 @@
 //! results come back to the UI as `Msg` values.
 
 use crate::gamesettings::{self, Profile};
+use crate::logwatch::Live;
 use crate::roblox::{self, ApiError, FriendGame, Game, Presence, Server, Target};
 use crate::store::{self, Account, ServerPick};
 use crate::{audio, multi};
@@ -44,6 +45,14 @@ pub enum Msg {
     Home { account: u64, part: HomePart },
     /// Avatar headshot URLs of the saved accounts.
     Avatars(HashMap<u64, String>),
+    /// The clients in a game right now, from Roblox's logs.
+    Live(Vec<Live>),
+    /// A client joined a server. `fresh` is false for joins from before the app was watching.
+    Joined { live: Live, fresh: bool },
+    /// What was looked up about a join: the game, and where its server is.
+    JoinInfo { live: Live, fresh: bool, game: Option<Game>, location: Option<String> },
+    /// Friends of saved accounts who just started playing: (name, game).
+    FriendsPlaying(Vec<(String, String)>),
 }
 
 /// One row of the Home page, or why it couldn't load.
@@ -126,6 +135,7 @@ pub struct Settings {
     pub anti_afk: bool,
     pub afk_minutes: u32,
     pub afk_jump: bool,
+    pub friend_alerts: bool,
 }
 
 impl Settings {
@@ -568,6 +578,88 @@ pub fn search_games(bg: &Bg, a: Acct, query: String) {
             games
         });
         bg.send(Msg::Home { account: a.id, part: HomePart::Search(result.map_err(|e| e.to_string())) });
+    });
+}
+
+/// Looks up the game and server location of a join. Neither needs an account.
+pub fn join_info(bg: &Bg, live: Live, fresh: bool, known_game: bool) {
+    bg.spawn(move |bg| {
+        let game = if known_game { None } else { roblox::game_brief(live.place, live.universe).ok() };
+        let location = live.ip.as_deref().and_then(|ip| roblox::locate(ip).ok());
+        bg.send(Msg::JoinInfo { live, fresh, game, location });
+    });
+}
+
+/// How often friend alerts look at who is playing.
+const FRIENDS_EVERY: Duration = Duration::from_secs(60);
+/// How long a friend list is reused before it's fetched again.
+const FRIEND_LIST_FOR: Duration = Duration::from_secs(600);
+
+/// Starts friend alerts: once a minute, checks which friends of the saved accounts are in a game
+/// and reports the ones who weren't the time before.
+pub fn start_friend_alerts(bg: &Bg) {
+    let bg = bg.clone();
+    thread::spawn(move || {
+        let mut lists: HashMap<u64, (Instant, Vec<u64>)> = HashMap::new();
+        // Friend -> game, from the last complete look. `None` until the first one.
+        let mut before: Option<HashMap<u64, String>> = None;
+        loop {
+            thread::sleep(FRIENDS_EVERY);
+            if !bg.settings().friend_alerts {
+                before = None;
+                continue;
+            }
+            let accounts = bg.watch().accounts.clone();
+            let own: Vec<u64> = accounts.iter().map(|a| a.id).collect();
+            let mut playing = HashMap::new();
+            let mut complete = true;
+            for a in &accounts {
+                let stale = lists.get(&a.id).is_none_or(|(at, _)| at.elapsed() > FRIEND_LIST_FOR);
+                if stale {
+                    match roblox::friend_ids(&a.cookie, a.id) {
+                        Ok(ids) => {
+                            lists.insert(a.id, (Instant::now(), ids));
+                        }
+                        Err(_) => complete = false,
+                    }
+                }
+                let Some((_, ids)) = lists.get(&a.id) else { continue };
+                // Presence is looked up as the friend's own friend, so their game is visible.
+                match roblox::presence_many(&a.cookie, ids) {
+                    Ok(list) => {
+                        for (id, p) in list.into_iter().filter(|(id, p)| p.kind == 2 && !own.contains(id)) {
+                            let game = if p.location.is_empty() { "a game".to_string() } else { p.location };
+                            playing.insert(id, game);
+                        }
+                    }
+                    Err(_) => complete = false,
+                }
+            }
+            // A failed lookup would look like friends leaving and joining again, so skip the round.
+            if !complete {
+                continue;
+            }
+            if let (Some(prev), Some(a)) = (&before, accounts.first()) {
+                let new: Vec<(u64, String)> =
+                    playing.iter().filter(|(id, _)| !prev.contains_key(id)).map(|(id, g)| (*id, g.clone())).collect();
+                if !new.is_empty() {
+                    let ids: Vec<u64> = new.iter().map(|(id, _)| *id).collect();
+                    let names = roblox::user_names(&a.cookie, &ids);
+                    let list = new
+                        .into_iter()
+                        .map(|(id, game)| {
+                            let name = names
+                                .get(&id)
+                                .map(|(n, d)| if d.is_empty() { n.clone() } else { d.clone() })
+                                .unwrap_or_else(|| "A friend".into());
+                            (name, game)
+                        })
+                        .collect();
+                    bg.send(Msg::FriendsPlaying(list));
+                }
+            }
+            before = Some(playing);
+        }
     });
 }
 

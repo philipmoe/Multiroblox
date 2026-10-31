@@ -115,6 +115,17 @@ impl ServerPick {
     }
 }
 
+/// A game or private server saved under a name, to join with one click.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SavedLink {
+    pub name: String,
+    /// What goes in the game field: a place ID, game link or private server link.
+    pub link: String,
+    /// A specific public server, if one was picked when saving.
+    #[serde(default)]
+    pub job: String,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Account {
     pub user_id: u64,
@@ -167,6 +178,13 @@ pub struct Config {
     /// Anti-AFK presses Space (jump); otherwise it nudges the mouse.
     pub afk_jump: bool,
     pub keep_awake: bool,
+    pub saved: Vec<SavedLink>,
+    /// Notification with the game and server location when a client joins.
+    pub notify_joins: bool,
+    /// Notification when a friend of any saved account starts playing.
+    pub friend_alerts: bool,
+    pub discord_on: bool,
+    pub discord_app_id: String,
 }
 
 impl Default for Config {
@@ -194,6 +212,11 @@ impl Default for Config {
             afk_minutes: 15,
             afk_jump: true,
             keep_awake: false,
+            saved: Vec::new(),
+            notify_joins: true,
+            friend_alerts: true,
+            discord_on: false,
+            discord_app_id: String::new(),
         }
     }
 }

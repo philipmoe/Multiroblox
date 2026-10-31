@@ -25,6 +25,25 @@ A discovery page for browsing and joining games without opening the Roblox websi
 Click a game to select it, or use **Play** (smart play: the Best server) to launch straight in. Search, Charts and
 the Continue list use unofficial Roblox endpoints, so a row may stop loading if Roblox changes them.
 
+### Live info, notifications and Discord
+
+Multi Roblox reads Roblox's own log files, so it knows about every client on this PC, also ones not
+started from here:
+
+- **Server location**: the header and account list show where each client's server is
+  (e.g. "London, GB"), and a Windows notification says which game and server a client joined.
+- **Recent servers**: the Servers window lists the last 30 servers any client was in, with a
+  **Rejoin** button for that exact server.
+- **Saved games and private servers**: save a game, server or private server link under a name and
+  join it in one click.
+- **Friend alerts**: a notification when a friend of any of your accounts starts playing.
+- **Discord status**: shows the game you're in on your Discord profile, with a Join button. Discord
+  needs an application ID: create one at discord.com/developers (its name is what your profile shows,
+  e.g. "Roblox") and paste its ID in Settings.
+
+Server locations are looked up from the server's address with ipinfo.io; your own address is never
+sent.
+
 ### Accounts and launching
 
 - **Multiple clients at once.** Holds Roblox's single-instance lock so every new client can start,

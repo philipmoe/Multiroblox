@@ -176,8 +176,35 @@ fn json_of(r: ureq::Response) -> Res<Value> {
     }
 }
 
+/// GET as the account that owns `cookie`, or signed out when it is empty.
 fn get_json(cookie: &str, url: &str) -> Res<Value> {
-    json_of(finish(agent().get(url).set("Cookie", &cookie_header(cookie)).call())?)
+    let mut req = agent().get(url);
+    if !cookie.is_empty() {
+        req = req.set("Cookie", &cookie_header(cookie));
+    }
+    json_of(finish(req.call())?)
+}
+
+/// Where a game server is, like "London, GB", from its public address.
+pub fn locate(ip: &str) -> Res<String> {
+    let v = json_of(finish(agent().get(&format!("https://ipinfo.io/{ip}/json")).call())?)?;
+    let part = |k: &str| v[k].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    match (part("city"), part("country")) {
+        (Some(city), Some(country)) => Ok(format!("{city}, {country}")),
+        (None, Some(country)) => Ok(country),
+        _ => Err(other("unknown location")),
+    }
+}
+
+/// Name and icon of a game, looked up signed out.
+pub fn game_brief(place: u64, universe: Option<u64>) -> Res<Game> {
+    let universe = match universe {
+        Some(u) => u,
+        None => universe_of("", place)?,
+    };
+    let mut games = game_details("", &[universe])?;
+    add_icons("", &mut games);
+    games.pop().ok_or_else(|| other("unknown game"))
 }
 
 fn post_json(cookie: &str, url: &str, body: &Value) -> Res<Value> {
@@ -607,19 +634,17 @@ pub fn search(cookie: &str, query: &str) -> Res<Vec<Game>> {
         .collect())
 }
 
-/// Friends of the user who are in a game right now, with names and avatars.
-pub fn friends_playing(cookie: &str, user_id: u64) -> Res<Vec<FriendGame>> {
+pub fn friend_ids(cookie: &str, user_id: u64) -> Res<Vec<u64>> {
     let v = get_json(cookie, &format!("https://friends.roblox.com/v1/users/{user_id}/friends"))?;
-    let ids: Vec<u64> = v["data"].as_array().into_iter().flatten().filter_map(|f| f["id"].as_u64()).collect();
-    let playing: Vec<(u64, Presence)> = presence_many(cookie, &ids)?.into_iter().filter(|(_, p)| p.kind == 2).collect();
-    if playing.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ids: Vec<u64> = playing.iter().map(|(id, _)| *id).collect();
+    Ok(v["data"].as_array().into_iter().flatten().filter_map(|f| f["id"].as_u64()).collect())
+}
 
+/// (username, display name) of users. Users that can't be looked up are left out.
+pub fn user_names(cookie: &str, ids: &[u64]) -> HashMap<u64, (String, String)> {
     let mut names = HashMap::new();
-    let body = serde_json::json!({ "userIds": ids, "excludeBannedUsers": false });
-    if let Ok(v) = post_json(cookie, "https://users.roblox.com/v1/users", &body) {
+    for chunk in ids.chunks(100) {
+        let body = serde_json::json!({ "userIds": chunk, "excludeBannedUsers": false });
+        let Ok(v) = post_json(cookie, "https://users.roblox.com/v1/users", &body) else { continue };
         for u in v["data"].as_array().into_iter().flatten() {
             if let Some(id) = u["id"].as_u64() {
                 let name = u["name"].as_str().unwrap_or_default().to_string();
@@ -627,6 +652,18 @@ pub fn friends_playing(cookie: &str, user_id: u64) -> Res<Vec<FriendGame>> {
             }
         }
     }
+    names
+}
+
+/// Friends of the user who are in a game right now, with names and avatars.
+pub fn friends_playing(cookie: &str, user_id: u64) -> Res<Vec<FriendGame>> {
+    let ids = friend_ids(cookie, user_id)?;
+    let playing: Vec<(u64, Presence)> = presence_many(cookie, &ids)?.into_iter().filter(|(_, p)| p.kind == 2).collect();
+    if playing.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<u64> = playing.iter().map(|(id, _)| *id).collect();
+    let mut names = user_names(cookie, &ids);
     let mut avatars = headshots(cookie, &ids);
 
     Ok(playing

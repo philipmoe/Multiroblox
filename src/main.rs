@@ -1,21 +1,28 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod discord;
 mod gamesettings;
 mod history;
 mod home;
+mod icon;
 mod imgcache;
-mod logwatch;
 mod jobs;
+mod live;
+mod logwatch;
 mod multi;
 mod roblox;
+mod servers;
 mod store;
+mod tray;
 
 use eframe::egui::{self, Color32, RichText};
 use history::History;
 use home::HomeState;
 use jobs::{Acct, Bg, HomePart, Msg, Watch};
+use live::LiveState;
 use roblox::{Presence, Server, Target};
+use servers::ServersTab;
 use store::ServerPick;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -66,12 +73,18 @@ struct App {
     servers_loading: bool,
     servers_failed: bool,
     fewest_first: bool,
+    servers_tab: ServersTab,
+    /// Name typed for "save the current game".
+    save_name: String,
     awake_applied: bool,
+    live: LiveState,
+    log_open: bool,
+    icon: egui::TextureHandle,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        apply_style(&cc.egui_ctx);
         let (tx, rx) = channel();
         let bg = Bg {
             tx,
@@ -82,6 +95,7 @@ impl App {
         jobs::start_watcher(&bg);
         jobs::start_anti_afk(&bg);
         jobs::start_status_refresh(&bg);
+        jobs::start_friend_alerts(&bg);
         logwatch::start(&bg);
         // Keep the startup entry pointing at this exe, in case it was moved.
         let start_with_windows = multi::starts_with_windows();
@@ -126,7 +140,16 @@ impl App {
             servers_loading: false,
             servers_failed: false,
             fewest_first: false,
+            servers_tab: ServersTab::default(),
+            save_name: String::new(),
             awake_applied: false,
+            live: LiveState::new(),
+            log_open: false,
+            icon: cc.egui_ctx.load_texture(
+                "app-icon",
+                egui::ColorImage::from_rgba_unmultiplied([64, 64], &icon::rgba(64)),
+                egui::TextureOptions::LINEAR,
+            ),
         };
         if freed > 0 {
             app.say(format!("Released the singleton lock in {freed} running client handle(s)."));
@@ -296,6 +319,7 @@ impl App {
             anti_afk: c.anti_afk,
             afk_minutes: c.afk_minutes,
             afk_jump: c.afk_jump,
+            friend_alerts: c.friend_alerts,
         }
     }
 
@@ -354,53 +378,81 @@ impl App {
                     }
                 }
                 Msg::Avatars(found) => self.avatars.extend(found),
+                Msg::Live(list) => self.live.sessions = list,
+                Msg::Joined { live, fresh } => self.on_joined(live, fresh),
+                Msg::JoinInfo { live, fresh, game, location } => self.on_join_info(live, fresh, game, location),
+                Msg::FriendsPlaying(list) => self.on_friends_playing(list),
             }
         }
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
+        let failed = self.held.iter().any(|s| matches!(s.state, multi::State::Failed(_)));
+        let taken = self.held.iter().any(|s| s.state == multi::State::AlreadyExisted);
+        let (lock, lock_color, lock_tip) = if failed {
+            ("Multi-instance off", RED, "Couldn't take Roblox's single-instance lock.")
+        } else if taken {
+            ("Lock held by a client", AMBER, "A running client holds the lock. Use More > Release lock.")
+        } else {
+            ("Multi-instance on", GREEN, "New Roblox clients can start next to running ones.")
+        };
+        // Who is in which game right now, e.g. "Philip · Brookhaven · London, GB".
+        let playing: Vec<String> = self
+            .live
+            .sessions
+            .iter()
+            .take(3)
+            .map(|s| {
+                let mut parts = vec![self.account_name(s.user)];
+                parts.extend(self.live.game_name(s.place).map(str::to_string));
+                parts.extend(self.live.location(s).map(str::to_string));
+                parts.join(" · ")
+            })
+            .collect();
+
         ui.horizontal(|ui| {
-            ui.heading("Multi Roblox");
-            ui.separator();
-            let failed = self.held.iter().any(|s| matches!(s.state, multi::State::Failed(_)));
-            let taken = self.held.iter().any(|s| s.state == multi::State::AlreadyExisted);
-            if failed {
-                ui.colored_label(RED, "Multi-instance lock failed");
-            } else if taken {
-                ui.colored_label(AMBER, "A client holds the lock - press Release");
-            } else {
-                ui.colored_label(GREEN, "Multi-instance active");
+            let icon = egui::load::SizedTexture::new(self.icon.id(), egui::vec2(22.0, 22.0));
+            ui.add(egui::Image::from_texture(icon));
+            ui.label(RichText::new("Multi Roblox").strong().size(17.0));
+            ui.add_space(6.0);
+            pill(ui, &format!("● {lock}"), lock_color).on_hover_text(lock_tip);
+            pill(ui, &format!("{} running", self.clients), BLUE);
+            for p in &playing {
+                pill(ui, p, GREEN);
             }
-            ui.label(format!("{} client(s) running", self.clients));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button("More", |ui| {
+                    if ui.button("Minimize alts").clicked() {
+                        let pids = self.alt_client_pids();
+                        for &pid in &pids {
+                            multi::minimize_client(pid);
+                        }
+                        self.say(format!("Minimized {} alt client(s).", pids.len()));
+                        ui.close();
+                    }
+                    if ui.button("Release lock").on_hover_text("Unlock the single-instance lock inside clients that were already running").clicked() {
+                        multi::drop_singletons(&mut self.held);
+                        let n = multi::release_in_running_clients();
+                        self.held = multi::acquire();
+                        self.say(format!("Released {n} handle(s)."));
+                        ui.close();
+                    }
+                    if ui.button("Servers...").clicked() {
+                        self.open_servers(ServersTab::Recent);
+                        ui.close();
+                    }
+                });
                 if ui.button("Kill all").on_hover_text("Close every running Roblox client").clicked() {
                     self.bg.watch().clients.clear();
                     let n = multi::kill_all();
                     self.count_clients();
                     self.say(format!("Closed {n} client(s)."));
                 }
-                if ui
-                    .button("Release")
-                    .on_hover_text("Unlock the singleton inside clients that were already running")
-                    .clicked()
-                {
-                    multi::drop_singletons(&mut self.held);
-                    let n = multi::release_in_running_clients();
-                    self.held = multi::acquire();
-                    self.say(format!("Released {n} handle(s)."));
-                }
                 if ui.button("Stop alts").on_hover_text("Close the alt clients started from here; main keeps running").clicked() {
                     self.stop_alts();
                 }
-                if ui.button("Minimize alts").on_hover_text("Minimize the alt clients started from here").clicked() {
-                    let pids = self.alt_client_pids();
-                    for &pid in &pids {
-                        multi::minimize_client(pid);
-                    }
-                    self.say(format!("Minimized {} alt client(s).", pids.len()));
-                }
                 if self.bg.jobs.load(Ordering::Relaxed) > 0 {
-                    ui.colored_label(BLUE, "Working...");
+                    ui.spinner();
                 }
             });
         });
@@ -418,9 +470,12 @@ impl App {
         );
         let mut browse = false;
         ui.horizontal(|ui| {
-            ui.label("Job ID (optional, to pick a server)");
+            ui.label("Job ID (optional)");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                browse = ui.small_button("Browse").on_hover_text("Pick from the game's open servers").clicked();
+                browse = ui
+                    .small_button("Servers...")
+                    .on_hover_text("Browse open servers, rejoin a recent one, or use a saved game")
+                    .clicked();
             });
         });
         let b = ui.add(egui::TextEdit::singleline(&mut self.cfg.job_id).desired_width(f32::INFINITY));
@@ -440,7 +495,8 @@ impl App {
                 });
         });
         if browse {
-            self.load_servers();
+            let tab = self.servers_tab;
+            self.open_servers(tab);
         }
         ui.add_space(6.0);
         ui.separator();
@@ -561,15 +617,10 @@ impl App {
         ui.add_space(4.0);
         let mut changed = false;
         let mut startup_failed = false;
+        let discord_status = self.live.discord_status.clone();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let c = &mut self.cfg;
-            ui.label(RichText::new("AFK mode").strong());
-            ui.label(
-                RichText::new("Applies to alts. Graphics and FPS take effect on the next launch, the rest right away.")
-                    .weak()
-                    .small(),
-            );
-            ui.add_space(2.0);
+            card(ui, "AFK mode", "Applies to alts. Graphics and FPS take effect on the next launch, the rest right away.", |ui| {
             changed |= ui
                 .checkbox(&mut c.afk_include_main, "Include main")
                 .on_hover_text("Also apply AFK mode to the main account.")
@@ -620,11 +671,9 @@ impl App {
                 .checkbox(&mut c.minimize_alts, "Minimize after launch")
                 .on_hover_text("Minimizes the window about 15 seconds after it opens.")
                 .changed();
+            });
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.label(RichText::new("Staying in game").strong());
-            ui.add_space(2.0);
+            card(ui, "Staying in game", "", |ui| {
             changed |= ui
                 .checkbox(&mut c.anti_afk, "Anti-AFK")
                 .on_hover_text(
@@ -656,21 +705,58 @@ impl App {
                 .checkbox(&mut c.keep_awake, "Keep PC awake")
                 .on_hover_text("Stops Windows from going to sleep while Multi Roblox is open. The screen can still turn off.")
                 .changed();
+            });
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.label(RichText::new("Launching").strong());
-            ui.add_space(2.0);
-            let sw = ui
-                .checkbox(&mut self.start_with_windows, "Start with Windows")
-                .on_hover_text("Opens Multi Roblox minimized when you sign in to Windows.");
-            if sw.changed() && !multi::set_start_with_windows(self.start_with_windows) {
-                self.start_with_windows = multi::starts_with_windows();
-                startup_failed = true;
-            }
-            ui.horizontal(|ui| {
-                ui.label("Delay between launches");
-                changed |= ui.add(egui::DragValue::new(&mut c.delay_secs).range(0..=120).suffix(" s")).changed();
+            card(ui, "Notifications", "Shown as Windows notifications from the tray icon.", |ui| {
+                changed |= ui
+                    .checkbox(&mut c.notify_joins, "When a client joins a game, with the server's location")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut c.friend_alerts, "When a friend of any of your accounts starts playing")
+                    .on_hover_text("Checked once a minute.")
+                    .changed();
+            });
+
+            card(ui, "Discord", "Shows the game you're in on your Discord profile, with a Join button for friends.", |ui| {
+                changed |= ui.checkbox(&mut c.discord_on, "Show what I'm playing on Discord").changed();
+                ui.add_enabled_ui(c.discord_on, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Application ID");
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut c.discord_app_id)
+                                    .hint_text("e.g. 1234567890123456789")
+                                    .desired_width(190.0),
+                            )
+                            .changed();
+                    });
+                    ui.label(
+                        RichText::new(
+                            "Discord needs one: at discord.com/developers click New Application, name it what \
+                             your profile should say (e.g. Roblox), then copy its Application ID here.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    if c.discord_on && !discord_status.is_empty() {
+                        let color = if discord_status == "Connected" { GREEN } else { AMBER };
+                        ui.colored_label(color, &discord_status);
+                    }
+                });
+            });
+
+            card(ui, "Launching", "", |ui| {
+                let sw = ui
+                    .checkbox(&mut self.start_with_windows, "Start with Windows")
+                    .on_hover_text("Opens Multi Roblox minimized when you sign in to Windows.");
+                if sw.changed() && !multi::set_start_with_windows(self.start_with_windows) {
+                    self.start_with_windows = multi::starts_with_windows();
+                    startup_failed = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Delay between launches");
+                    changed |= ui.add(egui::DragValue::new(&mut c.delay_secs).range(0..=120).suffix(" s")).changed();
+                });
             });
         });
         self.dirty |= changed;
@@ -735,7 +821,7 @@ impl App {
                                     ui.label(RichText::new("MAIN").small().strong().color(AMBER));
                                 }
                             });
-                            let (text, color) = if self.expired.contains(&id) {
+                            let (mut text, color) = if self.expired.contains(&id) {
                                 ("Session expired - re-add".to_string(), RED)
                             } else {
                                 match self.presence.get(&id) {
@@ -745,6 +831,10 @@ impl App {
                                     None => ("Status unknown".to_string(), Color32::GRAY),
                                 }
                             };
+                            let session = self.live.sessions.iter().find(|s| s.user == Some(id));
+                            if let Some(loc) = session.and_then(|s| self.live.location(s)) {
+                                text = format!("{text} · {loc}");
+                            }
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(format!("@{}", a.username)).weak().small());
                                 ui.label(RichText::new(text).color(color).small());
@@ -801,70 +891,76 @@ impl App {
         });
     }
 
-    fn servers_window(&mut self, ctx: &egui::Context) {
-        if !self.show_servers {
-            return;
-        }
-        let mut open = true;
-        let mut picked = None;
-        let mut reload = false;
-        egui::Window::new("Servers")
-            .open(&mut open)
-            .collapsible(false)
-            .default_size([340.0, 420.0])
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    reload |= ui.checkbox(&mut self.fewest_first, "Fewest players first").changed();
-                    reload |= ui.button("Reload").clicked();
-                });
-                ui.separator();
-                if self.servers_loading {
-                    ui.colored_label(BLUE, "Loading...");
-                } else if self.servers_failed {
-                    ui.colored_label(RED, "Could not load servers - see the log.");
-                } else if self.servers.is_empty() {
-                    ui.label(RichText::new("No open servers found.").weak());
-                } else {
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        egui::Grid::new("servers").num_columns(3).striped(true).spacing([16.0, 6.0]).show(ui, |ui| {
-                            for s in &self.servers {
-                                ui.label(format!("{}/{} players", s.playing, s.max));
-                                let ping = s.ping.map_or("-".to_string(), |p| format!("{p} ms"));
-                                ui.label(RichText::new(ping).weak());
-                                if ui.button("Use").on_hover_text(s.id.as_str()).clicked() {
-                                    picked = Some(s.id.clone());
-                                }
-                                ui.end_row();
-                            }
-                        });
-                    });
-                }
-            });
-        if let Some(id) = picked {
-            self.cfg.job_id = id;
-            self.dirty = true;
-            open = false;
-            self.say("Server picked - launches now go to that server.");
-        }
-        self.show_servers = open;
-        if reload {
-            self.load_servers();
-        }
-    }
-
+    /// The log: one line with the latest message, or the whole log when opened.
     fn log_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Log").strong());
-            if ui.small_button("Clear").clicked() {
-                self.log.clear();
+            let label = if self.log_open { "Hide log" } else { "Log" };
+            if ui.small_button(label).clicked() {
+                self.log_open = !self.log_open;
+            }
+            if self.log_open {
+                if ui.small_button("Clear").clicked() {
+                    self.log.clear();
+                }
+            } else if let Some(last) = self.log.last() {
+                ui.add(egui::Label::new(RichText::new(last).weak().small()).truncate());
             }
         });
-        egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-            for line in &self.log {
-                ui.label(RichText::new(line).monospace().small());
-            }
-        });
+        if self.log_open {
+            egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+                for line in &self.log {
+                    ui.label(RichText::new(line).monospace().small());
+                }
+            });
+        }
     }
+}
+
+/// A small rounded label in a tint of `color`.
+fn pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.16))
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| ui.label(RichText::new(text).color(color).small()))
+        .response
+}
+
+/// A settings group: a title, an optional note, then its controls.
+fn card(ui: &mut egui::Ui, title: &str, note: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(title).strong().size(15.0));
+        if !note.is_empty() {
+            ui.label(RichText::new(note).weak().small());
+        }
+        ui.add_space(4.0);
+        add(ui);
+    });
+    ui.add_space(8.0);
+}
+
+/// A calmer dark theme with rounder widgets and a blue accent.
+fn apply_style(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.style_mut_of(egui::Theme::Dark, |s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        s.spacing.button_padding = egui::vec2(10.0, 4.0);
+        let v = &mut s.visuals;
+        v.panel_fill = Color32::from_rgb(23, 25, 30);
+        v.window_fill = Color32::from_rgb(28, 31, 37);
+        v.extreme_bg_color = Color32::from_rgb(15, 16, 20);
+        v.faint_bg_color = Color32::from_rgb(30, 33, 40);
+        v.window_corner_radius = egui::CornerRadius::same(10);
+        v.selection.bg_fill = Color32::from_rgb(45, 105, 200);
+        let w = &mut v.widgets;
+        for state in [&mut w.noninteractive, &mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+            state.corner_radius = egui::CornerRadius::same(6);
+        }
+        w.inactive.weak_bg_fill = Color32::from_rgb(40, 44, 53);
+        w.hovered.weak_bg_fill = Color32::from_rgb(52, 58, 70);
+        w.active.weak_bg_fill = Color32::from_rgb(60, 68, 84);
+    });
 }
 
 impl eframe::App for App {
@@ -878,6 +974,7 @@ impl eframe::App for App {
         if self.last_poll.elapsed() >= Duration::from_secs(1) {
             self.count_clients();
         }
+        self.sync_discord();
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 
@@ -887,9 +984,13 @@ impl eframe::App for App {
             self.header(ui);
             ui.add_space(4.0);
         });
-        egui::Panel::bottom("log").resizable(true).default_size(120.0).show(ui, |ui| {
-            self.log_panel(ui);
-        });
+        // Separate ids so the open log keeps its own size.
+        let log = if self.log_open {
+            egui::Panel::bottom("log").resizable(true).default_size(160.0)
+        } else {
+            egui::Panel::bottom("log_line").resizable(false)
+        };
+        log.show(ui, |ui| self.log_panel(ui));
         egui::Panel::right("game").resizable(false).exact_size(290.0).show(ui, |ui| {
             self.game_panel(ui);
         });
@@ -907,6 +1008,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         store::save(&self.cfg);
+        self.live.tray.close();
     }
 }
 
@@ -935,7 +1037,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([940.0, 620.0])
             .with_min_inner_size([760.0, 480.0])
-            .with_title("Multi Roblox"),
+            .with_title("Multi Roblox")
+            .with_icon(Arc::new(egui::IconData { rgba: icon::rgba(64), width: 64, height: 64 })),
         ..Default::default()
     };
     eframe::run_native("Multi Roblox", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))

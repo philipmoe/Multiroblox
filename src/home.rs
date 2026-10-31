@@ -340,7 +340,7 @@ impl App {
             .or_else(|| self.cfg.accounts.first().map(|a| a.user_id))
     }
 
-    fn home_account(&mut self) -> Option<Acct> {
+    pub(crate) fn home_account(&mut self) -> Option<Acct> {
         let id = self.home_account_id()?;
         self.acct(id)
     }

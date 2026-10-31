@@ -19,10 +19,29 @@ pub struct Played {
     pub by_account: HashMap<u64, u64>,
 }
 
+/// A server some client on this PC was in.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Visit {
+    pub place: u64,
+    pub job: String,
+    pub user: Option<u64>,
+    /// Filled in once looked up.
+    pub game: String,
+    pub location: String,
+    /// Unix seconds.
+    pub at: u64,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct History {
     pub games: Vec<Played>,
+    /// Newest first.
+    #[serde(default)]
+    pub servers: Vec<Visit>,
 }
+
+/// How many recent servers are remembered.
+const MAX_SERVERS: usize = 30;
 
 fn path() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
@@ -103,6 +122,35 @@ impl History {
 
     pub fn get(&self, place: u64) -> Option<&Played> {
         self.games.iter().find(|g| g.place == place)
+    }
+
+    pub fn add_visit(&mut self, v: Visit) {
+        self.servers.retain(|s| s.job != v.job);
+        self.servers.insert(0, v);
+        self.servers.truncate(MAX_SERVERS);
+    }
+
+    /// Fills in a visit's game name and location once they're known.
+    pub fn describe_visit(&mut self, job: &str, game: &str, location: &str) {
+        for s in self.servers.iter_mut().filter(|s| s.job == job) {
+            if !game.is_empty() {
+                s.game = game.to_string();
+            }
+            if !location.is_empty() {
+                s.location = location.to_string();
+            }
+        }
+    }
+}
+
+/// "just now", "5m ago", "3h ago", "2d ago"
+pub fn ago(at: u64) -> String {
+    let secs = now().saturating_sub(at);
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
     }
 }
 
